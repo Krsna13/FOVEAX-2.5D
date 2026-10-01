@@ -61,3 +61,23 @@ GitHub allows release assets up to 2 GB; the zip is well below that.
 `packaging/foveax.spec` lists the modules that are loaded by name with
 `importlib` (the numbered scripts such as `src.10b_eval_distance_metrics`),
 which PyInstaller cannot discover on its own.
+
+## Two launch paths, one code path (launch profiles)
+
+`Launch_GUI.bat` (full local RELLIS-3D, every frame) and the packaged `FOVEAX.exe`
+(bundled sample) run exactly the same `src/` code. They differ only by a *launch
+profile* defined in `src/dashboard/profiles.py`:
+
+| | `full` (Launch_GUI.bat, source) | `release` (FOVEAX.exe) |
+|---|---|---|
+| data | `C:/dev/data/rellis3d` (or `FOVEAX_RELLIS_ROOT` / `--data-root`) | `data/rellis3d` next to the exe |
+| sequence / frames / `--rate-hz` | 00001 / all / 25 | 00001 / all (100 bundled) / 25 |
+| window label | "Dataset: RELLIS-3D sequence 00001, N frames (full dataset)" | "Sample data: N frames (full dataset not included)" |
+
+Select with `--dataset-profile full|release` (the frozen exe defaults to `release`,
+source to `full`); any other flag still overrides the profile. Missing data is an
+error, never a silent fallback. Checks that work in both: `--golden-check` (compares
+the first 10 real frames with `tests/golden/`, PASS/FAIL) and `--bench-frames N`
+(real painted/computed FPS, target shown separately). `packaging/build_app.py`
+produces `dist/FOVEAX-windows.zip` (the GitHub Release asset) and refreshes
+`dist/FOVEAX-windows/FOVEAX/`; `dist/` is git-ignored and never committed.

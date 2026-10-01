@@ -69,7 +69,7 @@ The dashboard provides real-time multi-panel telemetry during LiDAR streaming:
    - **HAZARD CLUSTERS**: Real-time connected components of blocked cells ($< 0.40$ traversability). Reports distance from ego, minimum traversability score, severity (**Critical** $< 0.20$ vs **Caution** $0.20\text{--}0.40$), confidence, topological classification (**Pothole** depression vs **Bump** step obstacle), and height/depth in meters.
 
 3. **SYSTEM (Hardware, Metrics & Accuracy)**:
-   - **HARDWARE**: Live frame processing rate ($30.0\text{ FPS}$), end-to-end perception latency ($86.6\text{ ms}$), CPU load ($27.9\%$), and system RAM usage ($70.3\%$).
+   - **HARDWARE**: Achieved frame rate (measured, shown beside the labelled target `--rate-hz`; on AC power about 31 frames computed and 25–28 painted per second, about 22 on battery — see `docs/validation_results.md` §5.2), end-to-end perception latency, CPU load, and system RAM usage. (The example screenshot above predates the pipeline work and shows the commanded rate, not an achieved one.)
    - **ACCURACY**: Real-time per-frame accuracy segmented across the 3 foveated distance rings: Near ($0\text{--}10\text{ m}$, $55{,}896$ points), Mid ($10\text{--}30\text{ m}$, $15{,}082$ points), and Far ($30\text{--}100\text{ m}$, $751$ points).
    - **EFFICIENCY**: Structural memory savings of the 2.5D adaptive foveated representation over uniform 3D voxels ($99.99\%$ fewer cells, $99.81\%$ memory/byte savings).
    - **EGO MOTION**: Point-cloud registration (ICP) estimated relative vehicle displacement between consecutive frames ($0.090\text{ m}$).
@@ -143,8 +143,8 @@ of it, not a separate measurement.
 | SemanticKITTI semantic accuracy (in-domain, real SalsaNext checkpoint) | **94.98%** overall (97.70% Near / 92.82% Mid / 87.28% Far) |
 | RELLIS-3D semantic accuracy (cross-domain, off-road, held-out sequence `00000`) | **6.65%** pretrained → **22.26%** with sensor-FOV + intensity adaptation → **81.53%** after fine-tuning on RELLIS-3D |
 | Memory reduction vs. uniform 3D voxel grid | **99.99%** cell reduction, **99.81%** byte reduction |
-| Real-time dashboard throughput (real RELLIS-3D data, 131,072 pts/frame) | `process_frame()` **128 ms/frame** (≈7.8 FPS) in the 2026-09-30 per-stage profile — below a 25–30 FPS target; see limitations |
-| Test suite | **505 tests** (see `docs/validation_results.md` §7 for the latest run) |
+| Real GUI throughput (real RELLIS-3D data, 131,072 pts/frame, measured wall clock) | AC power: **~31 frames/s computed, 25–28 frames/s actually painted** (battery: ~22 computed); the original GUI managed 5.8–8.0; output bit-identical. 30 painted FPS not demonstrated — see `docs/validation_results.md` §5.2 |
+| Test suite | **569 tests** (see `docs/validation_results.md` §7 for the latest run) |
 
 The RELLIS-3D progression is a real, documented finding: the pretrained
 SalsaNext checkpoint was trained on SemanticKITTI's Velodyne HDL-64E
@@ -321,9 +321,16 @@ python src/13_realtime_dashboard.py                                    # default
 python src/13_realtime_dashboard.py --source semantickitti --frames 50
 python src/13_realtime_dashboard.py --source rellis3d --sequence 00002 --frames 200
 
+# Any other LiDAR dataset or sensor dump (bin/npy/ply/pcd/csv, any layout) - see docs/input_sources.md:
+python src/13_realtime_dashboard.py --input-dir D:/my_lidar/scans --sensor-hz 10
+python src/13_realtime_dashboard.py --input-config configs/inputs/example_folder.yaml
+
 # Headless replay (no GUI, writes telemetry JSONL) — useful for CI/benchmarking:
 python src/13_realtime_dashboard.py --source semantickitti --frames 10 --headless
 python src/13_realtime_dashboard.py --source rellis3d --frames 10 --headless
+
+# Real GUI throughput (painted frames per second) with a time split (run on AC power):
+python tools/bench_gui_throughput.py
 
 # Per-stage timing of the real pipeline (mean/p50/p95 per stage + 1 Hz nvidia-smi log):
 python src/13_realtime_dashboard.py --profile --profile-frames 200 --source rellis3d --sequence 00001
@@ -370,12 +377,13 @@ Summarized from [`docs/validation_results.md` §5–§6](docs/validation_results
    `models/salsanext/rellis3d_finetuned/` for off-road scenes. The live
    dashboard's `--predictor salsanext` currently loads only the
    pretrained (20-class) checkpoint — it has no `--taxonomy` option yet.
-3. **Dashboard throughput is below typical 25–30 FPS real-time
-   targets.** `process_frame()` averages 128 ms (≈7.8 FPS) in the
-   per-stage profile, with detection/clustering the largest stage
-   (84 ms). The dashboard's on-screen FPS label shows the
-   configured playback rate, not measured throughput — use `--profile`
-   for real numbers.
+3. **Dashboard throughput is 3.5–4.5x the original but short of 30 painted
+   FPS on the development laptop.** On AC power it computes about 31 frames per
+   second and paints 25–28 of them (about 22 computed on battery), using worker
+   processes for upcoming frames and a background tracking thread. The FPS in
+   the window is the measured rate of frames handed to the UI. Re-measure on
+   your machine with `python tools/bench_gui_throughput.py`, which counts
+   painted frames (see `docs/validation_results.md` §5.2).
 4. **`MockObjectDetector` is a deterministic geometric baseline, not a
    trained AI detector** — it clusters points above a ground-height
    threshold; it does not perform learned object recognition. Real

@@ -3,9 +3,12 @@
     python packaging/build_app.py [--frames 100] [--rellis-root C:/dev/data/rellis3d] [--seq 00001]
 
 Produces dist/FOVEAX/FOVEAX.exe next to a small real RELLIS-3D sample
-(data/rellis3d/...) and dist/FOVEAX-windows.zip. Run it from the repository
-root with the project's virtual environment. PyInstaller is installed on
-demand.
+(data/rellis3d/...) and the golden reference files used by `FOVEAX.exe
+--golden-check` (golden/), zips it to dist/FOVEAX-windows.zip (the GitHub Release
+asset) and refreshes the unzipped copy dist/FOVEAX-windows/FOVEAX/ that the local
+"release" launch is run from. dist/ is git-ignored: the built app is never
+committed, only attached to a GitHub Release. Run it from the repository root with
+the project's virtual environment. PyInstaller is installed on demand.
 """
 from __future__ import annotations
 
@@ -50,9 +53,19 @@ def main() -> None:
             shutil.copy2(seq_dir / sub / (b.stem + pattern), dst / sub / (b.stem + pattern))
     shutil.copy2(ROOT / "packaging" / "APP_README.txt", app_dir / "README.txt")
     shutil.copy2(ROOT / "LICENSE", app_dir / "LICENSE")
+    golden_dst = app_dir / "golden"
+    golden_dst.mkdir(exist_ok=True)
+    shutil.copy2(ROOT / "tests" / "golden_utils.py", golden_dst / "golden_utils.py")
+    shutil.copy2(ROOT / "tests" / "golden" / "full_00001_golden.npz", golden_dst / "full_00001_golden.npz")
 
     zip_base = ROOT / "dist" / "FOVEAX-windows"
     shutil.make_archive(str(zip_base), "zip", ROOT / "dist", "FOVEAX")
+    unzipped = ROOT / "dist" / "FOVEAX-windows"
+    if unzipped.exists():
+        shutil.rmtree(unzipped)
+    unzipped.mkdir()
+    shutil.move(str(app_dir), str(unzipped / "FOVEAX"))
+    app_dir = unzipped / "FOVEAX"
     print(f"\nBuilt {app_dir / 'FOVEAX.exe'}\nZip:   {zip_base}.zip")
 
 

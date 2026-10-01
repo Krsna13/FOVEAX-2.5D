@@ -121,6 +121,8 @@ src/
 │                                  ego_motion_estimate.py (informational ICP only, no odometry)
 ├── training/                     rellis3d_dataset.py: splits (seq 00000 = held-out test) and
 │                                  range-image samples, preprocessing identical to predict()
+├── inputs/                       Pluggable LiDAR input layer: LidarSource interface, folder/rellis3d/
+│                                  semantickitti sources, format readers, config loader (docs/input_sources.md)
 ├── tracking/                     MultiObjectTracker, TrackState (Kalman filter tracking)
 ├── dashboard/                    FrameState/HardwareMetrics, DataStreamerThread.process_frame,
 │                                  Qt main window, Open3D viewer process, track_labels.py (3D box
@@ -135,6 +137,7 @@ ros2_ws/src/foveax_ros/foveax_ros/   Phase 10: lidar_node.py (plain rclpy.Node, 
                                       diagnostics.py
 
 docs/                              Phase-specific setup/implementation notes
+configs/inputs/                    Example input configs (RELLIS-3D, SemanticKITTI, generic folder)
 packaging/                         PyInstaller spec + build_app.py: standalone Windows app with a bundled
                                     RELLIS-3D sample, shipped on GitHub Releases (docs/packaging.md)
 outputs/phaseN/                    Generated artifacts per phase (git-ignored where large)
@@ -145,24 +148,56 @@ tests/                             pytest suite; conftest.py enforces torch-befo
 ## Dashboard Runtime Model (read before changing dashboard code)
 
 - **The GUI does not use `DataStreamerThread.run()`.** `DashboardApplication` (in
-  `src/13_realtime_dashboard.py`) is a pull-based playback controller: a `QTimer` on the Qt thread
-  calls `streamer.process_frame(idx, ...)` directly and stores each `FrameState` in
-  `_frame_cache[idx]`. STEP back replays cached states (the Kalman tracker is never run backward);
+  `src/13_realtime_dashboard.py`) is a pull-based playback controller: a single-shot `QTimer` on the Qt
+  thread, re-armed after every frame for only the time left in the `--rate-hz` budget (a periodic timer
+  left a third of each frame idle), shows one frame per tick and stores each `FrameState` in
+  `_frame_cache[idx]` (capped at 600 frames; older ones drop, and STEP back past them is refused rather
+  than recomputed). STEP back replays cached states (the Kalman tracker is never run backward);
   RESTART / environment switch replace the tracker and clear the cache, and frame indices restart
   at 0. `run()` (the QThread loop) is only a legacy path.
+- **Frames are computed in two stages so they can overlap across CPU cores.**
+  `DataStreamerThread.compute_stateless(idx, ts)` does everything that does not need the tracker (load,
+  detection + classification + terrain features, live accuracy, grids/hazards/corridor profile,
+  display-only thinning); `finish_frame(result, ts, fps)` does the Kalman tracking (strictly in frame
+  order), the ROI layer, corridor markers and FrameState assembly; `process_frame` is
+  `finish_frame(compute_stateless(...))`. `src/dashboard/frame_pipeline.py` runs `compute_stateless` in
+  worker processes for the next few frames (`--workers`, auto = half the physical cores + 1, max 6;
+  0 = off). It is skipped when a semantic predictor (a model) is active. `finish_frame` itself runs on
+  a background thread (`FrameFinisher`) in frame order, so the GUI thread only draws; **that thread is
+  the only user of the tracker while it runs, so stop it (`_stop_finisher`) before replacing the
+  tracker or the pipeline.** **Keep `compute_stateless` a pure function of (frame index, timestamp,
+  configuration)**; `tests/test_frame_pipeline.py` fails if pooled or threaded output differs from
+  sequential.
+- **A FrameState must own its tracks.** `MultiObjectTracker.update()` returns the tracker's live
+  `TrackState` objects, which later frames update in place; `finish_frame` stores per-frame
+  snapshots (`_snapshot_track`). Without that, cached frames change retroactively and another
+  thread would read objects mid-update.
+- **Perception output must stay bit-identical.** Do not add per-frame caches, throttles, thinned
+  inputs or "skip if far/static" shortcuts to any perception stage: an earlier set of such shortcuts
+  changed the grids, hazards and track metadata on every test frame (see
+  `docs/validation_results.md` §5.2). Anything that does run less often must be labelled in the UI
+  (the ICP ego-displacement is recomputed every `--ego-motion-every-n` = 30 frames and says so). To check
+  a change: dump all FrameState perception fields for ~40 real frames before/after and compare exactly.
+- **Timestamps come from the sensor rate, not the playback rate.** `DataStreamerThread.timestamp_for(idx)`
+  uses the source's own timestamps or `idx / sensor_hz` (`--sensor-hz`, default 10). `--rate-hz` only sets
+  playback speed; using it for timestamps distorts tracker speeds.
 - **Cached `FrameState`s must own their data.** Anything placed in a `FrameState` (grid arrays,
   `HardwareMetrics`) must not be a view of, or the same object as, a buffer reused on the next
   frame — step-back replays it later.
-- **Any per-frame throttle cache in `DataStreamerThread` must handle frame indices going
-  backward** (restart/environment switch) — a `frame_idx - cached_idx < N` check alone serves the
-  previous run's data.
+- The 3D view gets a **voxel-thinned copy** of the cloud (`FrameState.display_points`, `--display-voxel`,
+  default 0.15 m) and only the fields it draws; the footer labels it. Everything else uses all points.
 - The Open3D 3D view runs in a **separate process** fed through `o3d_queue` (drop-oldest), and its
   GLFW window is reparented into the Qt window via `win32_embed.py` (`--separate-windows` opts out).
   Alert cards and the threat toast are laid out inside the left panel, not floated over the 3D
   view — floating overlays lost z-order fights with the native Open3D child window
   (`tests/test_alert_card_placement.py`).
-- `state.metrics.fps` is the rate passed into `process_frame` (the target playback rate), **not a
-  measured frame rate**. Measure with `--profile` (per-stage mean/p50/p95 via
+- The FPS shown in the window is the measured wall-clock rate of frames handed to the UI
+  (`DashboardApplication._achieved_fps`). When the event loop never idles (`--rate-hz 1000`) Qt skips
+  repaints, so that can exceed what is actually painted (measured 28.3 handed vs about 26 painted at one
+  point). Measure honestly with `python tools/bench_gui_throughput.py` (real GUI, steady state, counts
+  painted frames, with a time split) **on AC power**: on battery the CPU is
+  power-limited, results swing by 2-3x within minutes, and only paired old-vs-new runs are meaningful.
+  For per-stage times use `--profile` (per-stage mean/p50/p95 via
   `src/dashboard/stage_timer.py`, CUDA-synchronized for GPU stages, 1 Hz `nvidia-smi` log to
   `outputs/phase12/gpu_util_profile.csv`). The profile runs Open3D in-process and off-screen, so its
   `open3d_update` cost is not what the separate-process live GUI pays per frame.

@@ -39,13 +39,15 @@ working code, tests, and generated outputs on disk. Phase 8B (PointPillars) is i
 - **Dashboard (Phase 9):** the PyQt5 + embedded Open3D dashboard runs end to end on real RELLIS-3D and
   SemanticKITTI data, with a pull-based playback controller (step/pause/restart/environment switch), 3D box
   labels, per-object terrain features, overhead/centerline panels and live accuracy. Throughput is below
-  real-time targets: `process_frame()` takes 128 ms/frame (≈7.8 FPS) in the 2026-09-30 `--profile` run.
+  the 30 FPS goal: after the 2026-10-01 pipeline work (worker processes, background tracking thread,
+  in-place rendering) the real GUI computes about 31 frames/s on AC power and paints 25–28 of them (about
+  22 computed on battery), against 5.2–8.0 for the original GUI, with output bit-identical. 30 painted FPS
+  was not demonstrated.
 - **Phase 11:** profiling, benchmarking and VRAM budgeting for the RTX 5050 Laptop GPU; no real TensorRT
   engine has been compiled from a trained checkpoint yet.
 
-**Repository state:** 505 tests, all passing on the committed code (`docs/validation_results.md` §7).
-Git history has phase-scoped commits; the "OPT-n" dashboard speed-ups (about 36 ms/frame faster, but with
-known bugs) are deliberately not committed.
+**Repository state:** 569 tests, all passing (`docs/validation_results.md` §7). The earlier "OPT-n"
+dashboard shortcuts were removed on 2026-10-01 because they changed perception output.
 
 ---
 
@@ -257,9 +259,11 @@ scaffolding exists, core logic is a documented stub), **❌ Not Started**.
   `--profile` per-stage timing harness (`stage_timer.py`).
 - **Committed 2026-09-30:** alert cards and threat toast moved from floating overlays into the left
   panel; default `--rate-hz` 14 → 30; `--ego-motion-every-n` flag (default 30); the app starts maximized.
-- **Held back (not committed):** a set of "OPT-n" caches/throttles in `data_streamer.py`,
-  `qt_main_window.py` and `open3d_viewer.py`. They cut `process_frame()` from 128 to about 92 ms but fail
-  2 tests and have known correctness issues (see §8.1). They remain only in the local working tree.
+- **Pipeline work, 2026-10-01:** `process_frame` split into `compute_stateless` + `finish_frame`; worker
+  processes (`frame_pipeline.py`) compute upcoming frames and `FrameFinisher` tracks on a background thread; corridor chart drawn with QPainter; in-place
+  list/table/label updates; playback timer re-armed by remaining budget; display-only thinned 3D cloud;
+  the earlier "OPT-n" shortcuts removed (they changed output on 40/40 test frames). Details and
+  measurements: `docs/validation_results.md` §5.2.
 - **Unit test coverage:** `tests/test_dashboard_state.py`, `test_dashboard_traversability_convention.py`,
   `test_data_streamer_sources.py`, `test_track_labels.py`, `test_tracked_objects_table.py`,
   `test_qt_dashboard_display_fixes.py`, `test_alert_card_placement.py`, `test_win32_zorder.py`,
@@ -571,8 +575,10 @@ End-to-end dashboard pipeline on real RELLIS-3D frames (131,072 points; `docs/va
 |---|---|
 | Headless replay (2026-09-13, commit `783e28f`, before later features) | 13.8 FPS overall, 60–65 ms/frame steady state |
 | `process_frame()` in `--profile` (2026-09-30, committed code, ground-truth predictor) | 128.4 ms mean, 163.0 ms p95 |
-| Same, with the held-back OPT-n speed-ups (same-day A/B) | 92.1 ms mean, 107.1 ms p95 |
-| Largest stage | detection/clustering + terrain features, 84 ms (62 ms with OPT-n) |
+| Real GUI, frames computed (2026-10-01, AC power; original GUI 5.8–8.0, same session) | 29.9–32.2 /s, about 31 |
+| Real GUI, frames actually painted (AC power, laptop at ~80% performance) | 25.2–28.3 /s |
+| Same on battery power (computed) | 17.9–24.7 /s, median about 22 |
+| Largest GUI-thread cost now | Qt painting, about 25–33 ms of a 33–40 ms frame |
 | SalsaNext forward pass (2026-09-20 profile, pretrained) | 42.4 ms, plus 19.5 ms range projection |
 
 ### 7.2 Expected (post-optimization, per `docs/phase11_deployment_and_optimization.md`)
@@ -599,31 +605,20 @@ Rewritten 2026-09-30; the earlier week-by-week checklist (dated 2026-09-11) is s
 is done (dashboard run end to end, RELLIS-3D domain gap resolved by fine-tuning, requirements pinned,
 README updated, 35 commits).
 
-### 8.1 Before committing the held-back OPT-n speed-ups (blocking)
-- [ ] Fix the 2 failing tests in `tests/test_dashboard_traversability_convention.py` (new `__init__`-only
-  attributes read by `_generate_maps` and `_render_grid_to_label`).
-- [ ] `data_streamer.py` OPT-12: `grid_maps["elevation"]` is a view of a buffer reused every frame, so a
-  cached `FrameState` shows the newest frame's elevation after STEP back.
-- [ ] `data_streamer.py` OPT-14: the cached `HardwareMetrics` object is mutated and shared across
-  `FrameState`s, so cached frames show the latest fps/latency.
-- [ ] `data_streamer.py` OPT-3/OPT-4: hazard and centerline caches compare `frame_idx - cached_idx`, which
-  goes negative after RESTART or an environment switch; the previous run's (or previous sequence's)
-  hazards and corridor profile are then served until the new index passes the old one.
-- [ ] `qt_main_window.py` OPT-7: the centerline chart's "unchanged" key only covers bin count, marker count,
-  first/last distance and the first bin's point count, so real height changes are skipped.
-- [ ] `qt_main_window.py` OPT-5: per-layer render cache can leave another layer's image on screen; the
-  overhead cache ignores the traversability grid and label size.
-- [ ] `data_streamer.py` OPT-15: voxel-downsampling before `_generate_maps` changes point density (used by
-  the uncertainty layer and hazard confidence) and z_min/z_max per cell — re-verify against the full
-  cloud or drop it.
-- [ ] `open3d_viewer.py`: `_TURBO_LUT` is rebuilt inside `update()` every frame, and the cached
-  `self._turbo_cmap` is unused.
+### 8.1 Performance follow-ups
+- [ ] 30 painted FPS: not demonstrated. 29.9–32.2 frames/s are computed on AC power but the best painted
+  rate measured is 28.3 (about 22 computed on battery).
+- [ ] Optional headroom: draw track labels in one overlay instead of about 20 native windows (up to about
+  12 ms); render the Open3D view off-screen instead of embedding a foreign window. Detection every 2nd
+  frame with Kalman prediction in between would help the workers by about a quarter but changes
+  detections, so it needs an explicit UI label and an accuracy comparison first.
+- [ ] Rebuild the Windows app (`packaging/build_app.py`) to ship the pipeline work; the published
+  release predates it. Re-run `tools/bench_gui_throughput.py` on other hardware before quoting a rate.
 
 ### 8.2 Next
 - [ ] Add `--taxonomy` to the dashboard (`make_semantic_predictor`) so the live view can run the
   fine-tuned RELLIS-3D checkpoint.
-- [ ] Show a measured FPS in the dashboard; `state.metrics.fps` is currently the target rate.
-- [ ] Reduce detection/clustering cost (84 ms/frame, largest pipeline stage).
+- [ ] Reduce detection/clustering cost further (now about 32 ms of an 84.5 ms worker frame).
 - [ ] Compile a real FP16 TensorRT engine from a trained checkpoint and measure it against §7.2.
 - [ ] Mitigate SemanticKITTI forgetting (replay/mixing) if one checkpoint must serve both domains.
 - [ ] First real ROS 2 run (`colcon build`, `ros2 launch`) against a bag or sensor.
@@ -634,13 +629,13 @@ README updated, 35 commits).
 ## 9. Success Criteria
 
 ### 9.1 Technical Success Metrics
-- [ ] End-to-end pipeline sustains a real-time frame rate (currently 128 ms per
-  `process_frame()`; target 25–30 FPS).
+- [ ] End-to-end GUI sustains 30 FPS painted: 3.5–4.5x the original (5.8–8.0 -> about 31 computed, 25–28
+  painted on AC power), but 30 painted FPS was not demonstrated.
 - [ ] TensorRT FP16 engine achieves the documented 2.5×–4× throughput improvement, measured.
 - [ ] Concurrent semantic + detection engines fit the 6 GB budget, verified with real engine sizes.
 - [x] Semantic segmentation validated against ground truth with a real model on two datasets:
   94.98% SemanticKITTI (pretrained), 81.53% RELLIS-3D held-out (fine-tuned).
-- [x] Full test suite green on the committed code (505 tests, 2026-09-30). The held-back OPT-n changes must keep it green (see §8.1).
+- [x] Full test suite green (569 tests, 2026-10-01).
 
 ### 9.2 SIH Submission Requirements
 - [x] GitHub repository with phase-scoped commit history; downloadable Windows app on the Releases page

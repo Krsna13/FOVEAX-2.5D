@@ -16,6 +16,9 @@ o3d_datas, o3d_binaries, o3d_hidden = collect_all("open3d")
 hidden = [
     "src.07_adaptive_2point5d_map",
     "src.10_ai_semantic_2point5d_map",
+    "src.inputs", "src.inputs.base", "src.inputs.formats", "src.inputs.sources", "yaml",
+    "src.dashboard.frame_pipeline", "src.dashboard.profiles",
+    "src.dashboard.golden_check", "src.dashboard.gui_bench",
     "src.10b_eval_distance_metrics",
     "src.11_object_detection_tracking",
     "src.dashboard.export_web_dashboard_data",

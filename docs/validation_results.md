@@ -10,10 +10,10 @@ On 2026-09-30 the foveated zones moved from 0–15 / 15–35 / 35–100 m to
 the problem statement's 0–10 / 10–30 / 30–100 m (cell sizes unchanged).
 §1–§3 were re-measured with the new zones the same day: every overall
 (0–100 m) accuracy reproduced exactly, only the per-bucket splits and
-the memory figures changed. §5.1 and §7 were also re-measured on 2026-09-30
-against the code that is committed on top of `f174f08` (the unfinished
-"OPT-n" dashboard speed-ups are not part of it); each section states which
-run it comes from.
+the memory figures changed. §5.1 is the per-stage profile taken on
+2026-09-30; **§5.2 is the GUI throughput after the 2026-10-01 pipeline work**
+(worker processes, in-place rendering). Each section states which run it
+comes from.
 
 ---
 
@@ -25,7 +25,7 @@ run it comes from.
 | Middle-zone resolution (10–30 m) | 20 cm | 20 cm | ✅ Met |
 | Far-zone resolution (30–100 m) | 50 cm | 50 cm | ✅ Met |
 | Memory reduction vs. uniform 3D voxel grid | Significant reduction | **99.99%** cell reduction, **99.81%** byte reduction (see §3) | ✅ Met |
-| Real-time dashboard operation | Live playback | **128 ms/frame** pipeline time (≈7.8 FPS), real RELLIS-3D data (see §5) | ⚠️ Below typical automotive real-time targets (25–30 FPS); see §6 |
+| Real-time dashboard operation | Live playback | AC power: **about 31 frames/s computed and handed to the UI** (29.9–32.2), of which **25–28 frames/s were actually painted** where paints were counted; battery: about 22. Original GUI: 5.8–8.0 (see §5.2) | ⚠️ ~3.5–4.5x faster than before, output bit-identical; **30 FPS is reached in frames computed but not demonstrated in frames painted** |
 | Semantic segmentation (in-domain) | Usable accuracy | 94.98% overall (SemanticKITTI, real SalsaNext checkpoint, see §2) | ✅ Met |
 | Semantic segmentation (cross-domain, RELLIS-3D) | N/A (stretch) | 22.26% overall after sensor adaptation only, **81.53% after fine-tuning** (see §2.3) | ✅ Met after fine-tuning (held-out test sequence, never seen in training) |
 
@@ -197,10 +197,11 @@ current zone config, not a per-frame measurement:
 
 ## 5. Dashboard Performance
 
-**Current numbers are in §5.1** (per-stage profile of the committed code:
-128.4 ms/frame). The headless replay below is an older measurement, taken
-on commit `783e28f` before the per-object terrain features, 3D labels and
-overhead/corridor panels were added, so it no longer describes the code:
+**Current GUI numbers are in §5.2.** §5.1 is the single-threaded per-stage
+profile from before that work (128.4 ms/frame), and the headless replay
+below is older still, taken on commit `783e28f` before the per-object
+terrain features, 3D labels and overhead/corridor panels were added, so
+neither describes today's GUI:
 
 Real headless replay, RELLIS-3D sequence `00001`, 30 real frames
 (`src/13_realtime_dashboard.py --headless`), 2026-09-13:
@@ -218,7 +219,7 @@ which together took real per-frame processing time from ~214 ms down to
 ~62–65 ms on this same real data (a ~3.3x improvement). See §6 for the
 honest gap to a 25–30 FPS target.
 
-### 5.1 Per-stage profile of the committed code (`--profile`, 2026-09-30)
+### 5.1 Single-threaded per-stage profile, before the pipeline work (`--profile`, 2026-09-30)
 
 `python src/13_realtime_dashboard.py --profile --profile-warmup 20
 --profile-frames 200 --source rellis3d --sequence 00001` (default
@@ -244,13 +245,6 @@ window and Open3D viewer real but off-screen and **in-process** (see
   ceiling for the pipeline itself.** The dashboard's on-screen latency
   (`state.metrics.latency_ms`) averaged 122.9 ms in the same run; it
   measures `process_frame()` only and excludes drawing.
-- **Held-back speed-ups, same-day A/B.** The working tree contains
-  unfinished dashboard speed-ups (caches and throttles, not committed
-  because of known bugs, see `PROJECT_STATUS.md` §8.1). Profiled
-  back to back under the same conditions they give **92.1 ms** per
-  frame (clustering 61.8 ms, grids 14.4 ms), about 36 ms (28%) faster.
-  Two earlier runs of that code gave 86.5 and 92.1 ms, so expect
-  roughly ±10% between runs on this laptop.
 - The in-process `open3d_update` cost is a profiling artifact: the live
   GUI runs Open3D in a separate process, so it is not added to the Qt
   thread's per-frame time.
@@ -263,6 +257,184 @@ window and Open3D viewer real but off-screen and **in-process** (see
   checkpoint, before the dashboard performance changes) measured
   `salsanext_forward` at 42.4 ms and `range_image_projection` at 19.5 ms
   per frame (`outputs/phase12/profile_run_raw.txt`).
+
+### 5.2 Real GUI throughput after the pipeline work (2026-10-01)
+
+**Result, stated precisely** (a frame can be *computed and handed to the UI*
+without being *painted*; Qt skips repaints when there is no idle gap, see
+"Computed versus painted" below):
+
+| | Original GUI | New GUI |
+|---|---:|---:|
+| Frames computed and handed to the UI, AC power | 5.8–8.0 /s | **29.9–32.2 /s** (about 31) when the laptop ran fast; 28.9–30.3 /s in a slower window |
+| Frames actually painted (map repaints counted), AC power | not counted (cannot exceed the row above) | **25.2–28.3 /s** (free-running 28.3; paced at 25.5–25.9) |
+| Frames computed, battery power | 5.2–6.7 /s | 17.9–24.7 /s (median about 22) |
+
+**So the GUI is about 3.5–4.5x faster than before with identical output. The
+30 FPS goal is reached in frames computed, but 30 painted frames per second
+was not demonstrated on this laptop: the best painted rate measured is 28.3.**
+(An earlier version of this section called the 30 FPS goal reached; that
+rested on counting computed frames, which overstates what is on screen by
+about 10%.)
+
+How it was measured: `tools/bench_gui_throughput.py` (and the equivalent
+scratch harness used for the comparisons) runs the **real** dashboard
+(PyQt5 window, embedded Open3D process, worker pool) on RELLIS-3D sequence
+`00001`, 131k points/frame, stops after 100 frames, and reports wall-clock
+frames per second excluding the first 12 frames (worker start-up, about
+10 s). Old and new code were run **alternately, back to back**, so both saw
+the same machine state.
+
+AC power (Windows "Balanced" plan, plugged in, battery 26–48%; processor
+performance counter 72–141% as turbo came and went), steady-state frames
+computed per second (this table counts computed frames, not painted ones):
+
+| Run | Original GUI | New GUI | Workers |
+|---|---:|---:|---:|
+| 1 | 7.0 | 28.5 | 6 (auto) |
+| 2 | 7.7 | 28.9 | 6 (auto) |
+| with tracking on a background thread: 3 | 7.2 | 30.0 | 6 |
+| 4 | 5.8 | 31.5 | 6 |
+| 5 | 8.0 | 29.9 | 6 |
+| worker-count test | — | 31.3 / 31.2 | 6 |
+| worker-count test | — | 30.8 / 30.9 | 8 |
+| worker-count test | — | 31.2 | 10 |
+| `tools/bench_gui_throughput.py` | — | 32.2 / 31.7 | 6 |
+
+Runs 1–2 are before tracking moved to a background thread (28.5–28.9 FPS);
+everything after it is 29.9–32.2, about 31 on average. More than 6 workers does
+not help once the GUI thread is the limit.
+
+Battery power (same code, charge falling from 66% to 27% while unplugged):
+
+| Run (battery %) | Original GUI | New GUI | Workers |
+|---|---:|---:|---:|
+| 57% | 5.22 FPS | 19.61 FPS | 4 |
+| 57% | 5.47 FPS | 17.89 FPS | 4 |
+| 42% | 6.69 FPS | 21.86 FPS | 4 |
+| 42% | — | 24.38 FPS | 6 |
+| 42% | 6.32 FPS | 21.27 FPS | 4 |
+| 34% | 5.2 FPS | 21.8 FPS | 6 |
+| 34% | 5.6 FPS | 24.7 FPS | 6 |
+
+**Computed versus painted.** Counting `QEvent.Paint` events on the 2D map and
+the corridor chart showed that with no wait between frames (`--rate-hz 1000`)
+the GUI computed 28.3–30.3 frames per second but repainted the map only
+25.5–28.3 times per second, because Qt coalesces repaints when its event loop
+never goes idle. Paced by a cap (`--rate-hz 30`), every computed frame was
+painted (25.2–25.9 per second) but the free-running mode was still faster
+(28.3 painted versus 25.2 in the same window), probably because idle gaps let
+cores clock down. `tools/bench_gui_throughput.py` therefore reports the painted
+rate as its headline number. Tried and rejected: Qt's precise timer (no change)
+and batching repaint requests with `setUpdatesEnabled` (no gain per label
+batch, clearly worse when applied to the whole window).
+
+**The power state decides the answer.** On battery the CPU is power-limited and
+its speed fell with the charge: the same single-process benchmark took 84.5 ms
+per frame early on and 167 ms at 27% (Windows reported 64% processor
+performance), and the original GUI measured 2.0 FPS at the worst moment. On AC
+(after the laptop cooled) a worker frame took 84.5–91.5 ms again. Always
+compare old and new alternately in one session, and measure on AC power with
+`python tools/bench_gui_throughput.py`.
+
+What limits it now (AC power, steady state, 6 workers, GUI thread per frame,
+`tools/bench_gui_throughput.py`, laptop at about 80% processor performance):
+
+| Per-frame GUI-thread time | Free-running | Paced at 30 Hz |
+|---|---:|---:|
+| Waiting for the next finished frame | 2.7 ms | 0.0 ms |
+| `update_ui` | 5.5 ms | 6.7 ms |
+| Qt event loop and painting | 24.7 ms | 32.9 ms |
+| **Frame time** | **33.0 ms (30.3 computed, 28.3 painted per second)** | **39.7 ms (25.2 per second)** |
+
+Earlier, with the laptop faster (processor performance up to 141%), the same
+free-running configuration computed 31.7–32.2 frames per second (about 31 ms
+per frame; waiting 3.7 ms, `update_ui` 4.5–5.0 ms, Qt 22.6–22.9 ms); paints
+were not counted in those runs.
+
+Further measurements: the worker pool alone (no GUI) delivered 7.2 / 10.7 /
+21.9 / 28.5 / 33.6 / 37.1 FPS with 1 / 2 / 3 / 4 / 6 / 8 workers (on battery),
+so workers are not the limit in isolation. On battery, with the track labels,
+the Open3D frame push and the UI update all switched off, the GUI was still
+limited to 28.3 FPS: the GUI thread and the Open3D process compete with the
+workers for one limited CPU budget (about 4 cores' worth). The Open3D push cost
+about 12 ms of GUI-thread time per frame, the native label windows about 12 ms,
+and embedding the 3D window about 5 ms.
+
+What changed:
+
+- **Rendering, in place:** the corridor chart is drawn with QPainter instead of
+  rebuilding a matplotlib figure (47 ms per frame in a profile); tracked-object
+  list, hazard table and every label write only what changed; track labels reuse
+  their native windows and only resize when the rounded width changes; the 2D
+  map layers use a precomputed colour table (pixel-identical, tested);
+  the session log stays open.
+- **Playback timer:** a periodic `QTimer` waited a whole extra interval after
+  every frame that overran its budget, leaving a third of each frame idle. It
+  is now re-armed for only the time remaining. No frame is skipped.
+- **Tracking on a background thread:** `FrameFinisher` runs `finish_frame` on a
+  thread, in frame order, so tracking overlaps Qt's C++ painting instead of
+  adding to the GUI thread (28.5–28.9 -> about 31 frames computed per second on AC). This exposed an
+  older latent bug: `MultiObjectTracker.update()` returns the tracker's own live
+  `TrackState` objects, which later frames update in place, so a `FrameState`
+  (including every frame cached for STEP back) changed retroactively. Each
+  frame now keeps a snapshot of its tracks (`tests/test_frame_pipeline.py`).
+- **Parallel frames:** `DataStreamerThread.process_frame` is split into
+  `compute_stateless` (load, detection, terrain features, accuracy, grids,
+  hazards, corridor profile; independent of the tracker) and `finish_frame`
+  (Kalman tracking in strict frame order, ROI layer, corridor markers). Worker
+  processes (`src/dashboard/frame_pipeline.py`) run `compute_stateless` for the
+  next few frames while the main process finishes and draws the current one.
+  `--workers` sets the count (auto: half the physical cores plus one, at most 6;
+  0 = single-threaded).
+- **Detector:** the cluster graph is converted to CSR with scipy's own kernel,
+  skipping duplicate-summing and index sorting it never needed. Clusters are
+  identical; a worker frame went from 98 to 84.5 ms.
+- **Display only:** the Open3D view gets a voxel-thinned copy of the cloud
+  (0.15 m, about 29k points) and only the fields it draws; the footer shows
+  "3D view display: N pts (thinned; all metrics use all points)". Every
+  perception stage and metric still uses all points. `--display-voxel 0` sends
+  the full cloud.
+- **Labelled cadence:** the ICP ego-displacement estimate is recomputed every
+  30th frame and the panel now says which frame it is from and how often it is
+  recomputed. No other stage is throttled.
+- **Removed:** the earlier "OPT-n" shortcuts (grid built from a thinned cloud,
+  terrain features skipped for far static objects, hazard and corridor profile
+  recomputed only every 2nd/3rd frame, reused grid buffers, lossy redraw
+  caches). They changed the output: against the pre-shortcut reference, **all
+  40 of 40 test frames differed** (1,134 of 6,400 elevation cells in frame 0,
+  36 vs 41 hazard clusters, different road width, uncertainty and track
+  metadata).
+
+Exactness: for 40 real frames of sequence `00001`, every perception output
+(all five grid layers, hazard clusters, tracks and their metadata, classes,
+elevation and corridor profiles, road width, uncertainty, live accuracy) of the
+new single-threaded path **and** of the 3-worker path equals the output of the
+code before the shortcuts (commit `571c976`) bit for bit, NaN-aware.
+`tests/test_frame_pipeline.py` keeps pooled == sequential in the test suite.
+
+Headless: the single-threaded `--headless` path was not re-measured cleanly
+(the throttled laptop varied 135–529 ms for identical code within minutes, so
+no honest figure exists for this session). From measurements taken in stable
+windows, one worker frame is 84.5 ms and finishing it about 7 ms, so about
+10–11 FPS single-threaded; treat that as an estimate, not a measurement.
+
+What was not done:
+
+- **GPU step skipped on purpose.** The grid binning that could move to CUDA is
+  about 2 ms of a worker frame and the overhead-clearance grid about 9 ms. That
+  saves at most 8% of worker time at the cost of a CUDA context per worker, and
+  it was not judged worth it (30 FPS is reached in frames computed, not in
+  frames painted — see §5.2).
+- **Headroom, if more is wanted (not applied):** the GUI thread is now the
+  limit, with about 25–33 ms of Qt painting per frame. Options: draw the track
+  labels inside one overlay instead of about 20 native windows (up to about
+  12 ms; needs a layered-window design); render the Open3D view off-screen and
+  show it as an image instead of embedding a foreign window (removes the
+  cross-process window sync, adds image transfer); run object detection every
+  2nd frame with Kalman prediction in between (saves about a quarter of worker
+  time, **would change detections** so it needs an explicit "updated every 2nd
+  frame" UI label and an accuracy comparison first).
 
 **Do not quote the "145–171 FPS" MockObjectDetector figure as
 representative of real dashboard performance** — that number was
@@ -287,13 +459,12 @@ project's real-data throughput.
    `models/salsanext/rellis3d_finetuned/` for off-road/RELLIS-3D-like
    scenes. Resolving this would need replaying real SemanticKITTI
    samples during fine-tuning (not done here).
-3. **Dashboard throughput is well below typical 25–30 FPS real-time
-   targets.** `process_frame()` takes 128 ms per real 131k-point frame
-   (≈7.8 FPS) in the 2026-09-30 profile (§5.1); an earlier headless run
-   measured 13.8 FPS before later features were added. Detection,
-   clustering and per-object terrain features (84 ms/frame) are the
-   largest stage. Unfinished speed-ups that cut this to about 92 ms are
-   held back until their bugs are fixed.
+3. **Dashboard throughput is 3.5–4.5x the original but still short of 30
+   painted FPS on the development laptop.** On AC power the GUI computes about
+   31 frames per second but paints 25–28 of them (about 22 computed on battery),
+   up from 5.2–8.0 for the original GUI (§5.2). Other machines need
+   `tools/bench_gui_throughput.py` to find their rate. The GUI thread's Qt
+   painting (about 25–33 ms per frame) is the largest single cost.
 4. **`MockObjectDetector` is a deterministic geometric baseline, not a
    trained AI detector** — it clusters points above a ground-height
    threshold; it does not perform learned object recognition. Real
@@ -323,8 +494,14 @@ checkpoints present):
 505 passed, 32 warnings in 5.46s
 ```
 
-The unfinished "OPT-n" dashboard speed-ups (kept out of the commit) fail 2
-tests in `tests/test_dashboard_traversability_convention.py`: those tests
-build `DataStreamerThread` and `FoveaXDashboardWindow` via `__new__`, and the
-speed-up code reads attributes that only `__init__` sets. They also have
-correctness bugs listed in `PROJECT_STATUS.md` §8.1.
+**Fresh run, 2026-10-01** (after the pipeline work; includes the new
+input-layer tests, pooled-vs-sequential tests, pixel-equivalence tests for
+the 2D map renderers, and detector-graph tests):
+
+```
+569 passed in about 20 s
+```
+
+(One run on the throttled laptop took 74 s; the count was the same.) The
+2026-09-30 note about two failing tests no longer applies: the "OPT-n"
+shortcuts that caused them were removed in this work.
