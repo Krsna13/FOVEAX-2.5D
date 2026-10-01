@@ -1,0 +1,5 @@
+# SemanticKITTI (Velodyne HDL-64E, urban).
+type: semantickitti
+root: ../../data/semantic_kitti/dataset/sequences   # relative to this file
+sequence: "00"
+sensor_hz: 10

@@ -1,0 +1,5 @@
+# RELLIS-3D through the generic input layer (Ouster OS1-64, off-road).
+type: rellis3d
+root: C:/dev/data/rellis3d      # folder that contains Rellis-3D/
+sequence: "00001"
+sensor_hz: 10

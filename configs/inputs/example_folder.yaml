@@ -1,0 +1,26 @@
+# Template for ANY other LiDAR dataset or sensor dump: a folder of scan files.
+# Every key except `path` is optional. See docs/input_sources.md.
+type: folder
+path: D:/my_lidar/scans            # relative paths resolve against this file's folder
+pattern: "*.bin"                   # default: the most common supported extension
+format: bin                        # bin | npy | npz | ply | pcd | csv | txt | xyz
+n_cols: 5                          # float32 values per point in .bin (KITTI 4, nuScenes 5)
+columns: {x: 0, y: 1, z: 2, intensity: 3}   # which columns hold what (intensity may be null)
+axes: "x,y,z"                      # sensor axes -> vehicle frame, e.g. "-y,x,z"
+z_offset: 0.0                      # metres added to z so the ground sits near z = 0
+intensity_scale: 1.0               # e.g. 0.00392 to turn 0-255 into 0-1
+drop_zero_returns: false           # true if the sensor pads missing returns with (0,0,0)
+max_range_m: 100
+sensor:
+  name: My LiDAR
+  hz: 10                           # scan rate: timestamps and m/s speeds come from this
+  fov_up: 15.0                     # optional: passed to SalsaNext's projection
+  fov_down: -25.0
+timestamps:
+  mode: index                      # index | filename | file
+  # unit: ns                       # for filename/file modes: s | ms | us | ns
+labels:                            # optional ground truth for the live accuracy panel
+  dir: ../labels
+  ext: .label
+  format: semantickitti            # semantickitti | uint8 | uint16 | int32 | npy
+  map: semantickitti               # semantickitti | rellis3d | foveax | {raw_id: foveax_id, ...}
