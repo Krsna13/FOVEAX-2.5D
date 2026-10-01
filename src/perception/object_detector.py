@@ -218,6 +218,42 @@ _MOCK_DEFAULTS = {
 }
 
 
+def _component_labels(n: int, pairs: np.ndarray) -> np.ndarray:
+    """Connected-component label per point for the radius graph given as
+    (i, j) pairs (query_pairs output: unique, i < j).
+
+    The straightforward `coo_matrix(...)` -> connected_components() spends about
+    half its time summing duplicate entries and sorting column indices inside the
+    COO->CSR conversion, work this graph never needs (no duplicates, and
+    component search does not need sorted columns). The same CSR is built here
+    with scipy's own counting-sort kernel, then handed to the same
+    connected_components(). The partition into components, and so every cluster,
+    is identical (checked on real frames in tests/test_object_detector_graph.py);
+    only the intermediate label numbering could differ and callers re-sort
+    clusters by their smallest point index anyway.
+    """
+    from scipy.sparse import coo_matrix, csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    if len(pairs) == 0:
+        return connected_components(coo_matrix((n, n), dtype=bool), directed=False)[1]
+    try:
+        from scipy.sparse import _sparsetools  # private kernel; fall back if it moves
+
+        rows = np.ascontiguousarray(pairs[:, 0], dtype=np.int32)
+        cols = np.ascontiguousarray(pairs[:, 1], dtype=np.int32)
+        nnz = len(rows)
+        indptr = np.empty(n + 1, dtype=np.int32)
+        indices = np.empty(nnz, dtype=np.int32)
+        ones = np.ones(nnz, dtype=np.float64)
+        out = np.empty(nnz, dtype=np.float64)
+        _sparsetools.coo_tocsr(n, n, nnz, rows, cols, ones, indptr, indices, out)
+        graph = csr_matrix((out, indices, indptr), shape=(n, n))
+    except Exception:
+        graph = coo_matrix((np.ones(len(pairs), dtype=bool), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
+    return connected_components(graph, directed=False)[1]
+
+
 def _voxel_cluster_key(point: np.ndarray, voxel_size: float) -> tuple[int, int, int]:
     """Voxel index tuple for a single 3-D point.
 
@@ -529,13 +565,7 @@ class MockObjectDetector(ObjectDetector):
                 # first, which only added sparse-matrix construction
                 # overhead (sum_duplicates/sort_indices) without changing
                 # the resulting components.
-                if len(pairs) > 0:
-                    data = np.ones(len(pairs), dtype=bool)
-                    adjacency = coo_matrix((data, (pairs[:, 0], pairs[:, 1])), shape=(n, n))
-                else:
-                    adjacency = coo_matrix((n, n), dtype=bool)
-
-                _, labels = connected_components(adjacency, directed=False)
+                labels = _component_labels(n, pairs)
 
                 # Group point indices by component, then order components
                 # the same way the old sequential BFS discovered them: by

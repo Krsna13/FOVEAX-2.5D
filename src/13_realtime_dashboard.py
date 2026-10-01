@@ -19,18 +19,79 @@ except ImportError:
     pass
 
 from PyQt5.QtWidgets import QApplication
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import Qt, QTimer
 
 from src.dashboard.qt_main_window import FoveaXDashboardWindow
 from src.dashboard.open3d_viewer import FoveaX3DViewer
 from src.dashboard.data_streamer import DataStreamerThread
 from src.perception.object_detector import MockObjectDetector
 
+def resolve_input(args):
+    """Build the optional custom LiDAR source and fill in sensor settings on *args*.
+
+    Sets args.lidar_source (None for the built-in sources) and args.sensor_hz.
+    """
+    args.lidar_source = None
+    if getattr(args, "input_config", None) or getattr(args, "input_dir", None):
+        from src.inputs import load_source_config, source_from_dir
+
+        if args.input_config and args.input_dir:
+            raise SystemExit("Use either --input-config or --input-dir, not both.")
+        try:
+            args.lidar_source = (load_source_config(args.input_config) if args.input_config
+                                 else source_from_dir(args.input_dir))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"Input error: {exc}")
+        args.source = "custom"
+        print(f"[INFO] Input: {args.lidar_source.describe()}")
+        # Sensor geometry from the config feeds SalsaNext unless set explicitly.
+        for key in ("fov_up", "fov_down"):
+            if getattr(args, key, None) is None and args.lidar_source.sensor.get(key) is not None:
+                setattr(args, key, float(args.lidar_source.sensor[key]))
+    if getattr(args, "sensor_hz", None) is None:
+        args.sensor_hz = args.lidar_source.sensor_hz if args.lidar_source is not None else 10.0
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="FOVEAX Phase 9 - Real-Time Dashboard")
     parser.add_argument(
-        "--source", type=str, choices=["sample", "semantickitti", "rellis3d"],
-        default="rellis3d", help="Data source ('sample', 'semantickitti', 'rellis3d')"
+        "--source", type=str, choices=["sample", "semantickitti", "rellis3d", "custom"],
+        default="rellis3d", help="Data source ('sample', 'semantickitti', 'rellis3d'; "
+                                 "'custom' is set automatically by --input-config/--input-dir)"
+    )
+    parser.add_argument(
+        "--input-config", type=str, default=None,
+        help="YAML/JSON file describing any LiDAR dataset or sensor dump "
+             "(see docs/input_sources.md and configs/inputs/)."
+    )
+    parser.add_argument(
+        "--input-dir", type=str, default=None,
+        help="Shortcut: a folder of point-cloud files (bin/npy/npz/ply/pcd/csv/txt), format auto-detected."
+    )
+    parser.add_argument(
+        "--sensor-hz", type=float, default=None,
+        help="Scan rate of the sensor that recorded the data, used for timestamps and m/s speeds "
+             "(default: the input config's sensor.hz, else 10). Separate from --rate-hz, the playback speed."
+    )
+    parser.add_argument(
+        "--dataset-profile", type=str, default=None, choices=["full", "release"],
+        help="Launch profile (src/dashboard/profiles.py): 'full' = local full dataset, every frame "
+             "(default from source / Launch_GUI.bat); 'release' = the bundled sample next to the exe "
+             "(default for the packaged app). Same code either way; only data location and defaults differ."
+    )
+    parser.add_argument(
+        "--data-root", type=Path, default=None,
+        help="RELLIS-3D folder (contains Rellis-3D/<sequence>/...); overrides the profile's location "
+             "(for the full profile also settable with the FOVEAX_RELLIS_ROOT environment variable)."
+    )
+    parser.add_argument(
+        "--golden-check", action="store_true",
+        help="Run the real pipeline on the first 10 real frames and compare with the stored reference "
+             "output (tests/golden/); prints PASS/FAIL and exits. Works in the packaged exe too."
+    )
+    parser.add_argument(
+        "--bench-frames", type=int, default=None,
+        help="Open the real GUI, play this many frames, print the painted/computed frame rates and exit."
     )
     parser.add_argument(
         "--detector", type=str, choices=["mock", "pointpillars"],
@@ -46,16 +107,31 @@ def parse_args():
         # terrain features -- real overhead obstacles from frame 0 onward,
         # a real depression (~3.5m into the corridor), and a real height
         # bump (~4.8m) -- see docs referenced in the task report. At the
-        # real confirmed throughput (~14.7 FPS) and the --rate-hz default
-        # below, 1700 real frames span ~121s (~2:01), comfortably inside
-        # the sequence's 2319 available real frames -- no stitching or
-        # looping needed.
-        "--frames", type=int, default=1700,
-        help="Number of frames to process"
+        # --rate-hz default below (25 FPS, what the real GUI paints when paced,
+        # measured on the development laptop) 3000 frames would be exactly 2:00;
+        # sequence 00001 has 2319 real frames, so playback ends at frame 2319
+        # (~1:33) -- no stitching or looping needed.
+        "--frames", type=int, default=None,
+        help="Number of frames to play (default: every frame the data has -- set by the launch profile, "
+             "see src/dashboard/profiles.py; a number larger than the data simply ends at its last frame)."
     )
     parser.add_argument(
-        "--rate-hz", type=float, default=30.0,
-        help="Target streaming rate in Hz (default increased to 30 for smoother playback)"
+        "--rate-hz", type=float, default=None,
+        help="Playback rate cap in Hz (default from the launch profile: 25 = the rate the real GUI actually paints when paced, "
+             "measured on the development laptop; 1000 = free-running, which painted about 28 FPS there; "
+             "run tools/bench_gui_throughput.py to find your machine's rate)"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=-1,
+        help="Worker processes that compute upcoming frames in parallel while the current "
+             "one is tracked and drawn (-1 = auto: half the physical cores plus one, at most 6; "
+             "0 = off, fully sequential). Output is identical either way. Ignored when a "
+             "SalsaNext/mock semantic predictor is active (sequential then)."
+    )
+    parser.add_argument(
+        "--display-voxel", type=float, default=0.15,
+        help="Voxel size (m) of the thinned point cloud sent to the 3D VIEW ONLY; every "
+             "perception stage still uses all points (0 = send the full cloud)."
     )
     parser.add_argument(
         "--ego-motion-every-n", type=int, default=30,
@@ -210,11 +286,9 @@ class DashboardApplication:
             export_module = importlib.import_module("src.dashboard.export_web_dashboard_data")
             semantic_predictor = export_module.make_semantic_predictor(args.predictor, args)
 
-        # The packaged app ships a small RELLIS-3D sample next to the exe;
-        # prefer it over any dataset path baked into the source install.
-        bundled_root = None
-        if getattr(sys, "frozen", False) and args.source == "rellis3d" and Path("data/rellis3d").exists():
-            bundled_root = Path("data/rellis3d")
+        # Data location comes from the launch profile (src/dashboard/profiles.py):
+        # the full local dataset for Launch_GUI.bat, the bundled sample for the packaged app.
+        data_root = getattr(args, "data_root", None)
 
         self.streamer = DataStreamerThread(
             source=args.source,
@@ -224,14 +298,17 @@ class DashboardApplication:
             rate_hz=args.rate_hz,
             semantic_predictor=semantic_predictor,
             predictor_mode=args.predictor,
-            data_root=bundled_root,
+            data_root=data_root,
+            lidar_source=getattr(args, "lidar_source", None),
+            sensor_hz=getattr(args, "sensor_hz", None),
         )
         self.streamer._setup_sources()
         # A recorded sequence can hold fewer frames than --frames (e.g. the
         # small sample bundled with the packaged app). Playing past the last
         # file would wrap around and jump back to the start mid-run, so clamp.
-        if self.streamer._file_list:
-            self.streamer.num_frames = min(args.frames, len(self.streamer._file_list))
+        available = self.streamer.available_frames()
+        if available:
+            self.streamer.num_frames = min(args.frames, available)
 
         # Cache of already-computed real FrameStates, keyed by frame index.
         # Stepping backward replays an already-computed real frame from
@@ -244,6 +321,8 @@ class DashboardApplication:
         self._playback_idx = -1
         self._playing = True
         self._rate_hz = args.rate_hz
+        self._frame_render_times: list[float] = []
+        self._achieved_fps: float = self._rate_hz
 
         self.qt_window.play_pause_requested.connect(self._toggle_play_pause)
         self.qt_window.step_forward_requested.connect(lambda: self._show_frame(self._playback_idx + 1))
@@ -251,9 +330,34 @@ class DashboardApplication:
         self.qt_window.rate_changed.connect(self._set_rate_hz)
         self.qt_window.restart_requested.connect(self._restart)
         self.qt_window.environment_requested.connect(self._switch_environment)
+        self.qt_window.load_dataset_requested.connect(self._load_custom_dataset)
+        if self.streamer.lidar_source is not None:
+            # The two buttons switch between RELLIS-3D sequences; a custom input has
+            # no such sequences, so showing them would mislabel the data.
+            self.qt_window.env1_btn.hide()
+            self.qt_window.env2_btn.hide()
+        else:
+            # Only offer a sequence that is actually on disk (the packaged sample has just 00001).
+            from src.dashboard.profiles import rellis_frame_count
+
+            root = data_root or Path("C:/dev/data/rellis3d")
+            for btn, name in ((self.qt_window.env1_btn, "00001"), (self.qt_window.env2_btn, "00003")):
+                if args.source != "rellis3d" or rellis_frame_count(root, name) == 0:
+                    btn.hide()
+        self.qt_window.set_dataset_banner(getattr(args, "dataset_banner", None),
+                                          sample=getattr(args, "dataset_profile", None) == "release")
         self.qt_window.set_rate_hz(self._rate_hz)
 
+        # Single-shot, re-armed after every frame for only the time LEFT in the
+        # frame budget (see _on_timer_tick). A periodic QTimer waits a whole extra
+        # interval after a frame that overran its budget, which left a third of each
+        # frame idle at 30 Hz.
+        # PreciseTimer: the default coarse timer on Windows has ~15.6 ms granularity, so a
+        # requested 21 ms wait fires after ~31 ms and a capped rate ran 10-20% slower than
+        # an uncapped one (measured, alternating runs).
         self.playback_timer = QTimer()
+        self.playback_timer.setTimerType(Qt.PreciseTimer)
+        self.playback_timer.setSingleShot(True)
         self.playback_timer.timeout.connect(self._on_timer_tick)
         self._apply_timer_interval()
 
@@ -265,9 +369,112 @@ class DashboardApplication:
         # computed only every few real frames rather than every one.
         self._ego_motion_every_n_frames = args.ego_motion_every_n
         self._last_ego_motion_m: float | None = None
+        self._last_ego_frame: int | None = None  # frame the estimate was computed at
+
+        # Frames kept for STEP back. Capped so a long run cannot fill RAM (each
+        # state holds a full 131k-point cloud, ~2 MB); older frames drop first.
+        self._frame_cache_max = 600
+        self.streamer.display_voxel_m = float(getattr(args, "display_voxel", 0.15))
+        self._pipeline = None
+        self._finisher = None
+        self._pipeline_workers = getattr(args, "workers", -1)
+        self._start_pipeline()
 
         self._screenshot_after = getattr(args, "screenshot_after", None)
         self._screenshot_path = getattr(args, "screenshot_path", None)
+
+    # ---- parallel frame pipeline (src/dashboard/frame_pipeline.py) ---------
+    def _pipeline_allowed(self) -> bool:
+        # A semantic predictor holds a model (GPU) that is not shared with workers.
+        return self._pipeline_workers != 0 and self.streamer.semantic_predictor is None
+
+    def _start_pipeline(self):
+        if not self._pipeline_allowed():
+            return
+        from src.dashboard.frame_pipeline import FramePipeline, config_from_streamer, default_worker_count
+
+        workers = default_worker_count() if self._pipeline_workers < 0 else self._pipeline_workers
+        try:
+            self._pipeline = FramePipeline(
+                config_from_streamer(self.streamer), workers, self._ego_motion_every_n_frames)
+            self._pipeline.prefetch(0, self.streamer.timestamp_for)  # workers boot while the window opens
+            self._start_finisher(0)
+            print(f"[INFO] Frame pipeline: {workers} worker process(es) computing frames ahead, "
+                  "tracking on a background thread (output identical to sequential).")
+        except Exception as exc:
+            self._pipeline = None
+            print(f"[WARNING] Could not start the frame pipeline ({exc}); running sequentially.")
+
+    def _reset_pipeline(self):
+        """After a restart / environment switch / dataset load: drop queued work and
+        rebuild the workers only if their configuration changed."""
+        if not self._pipeline_allowed():
+            self._stop_pipeline()
+            return
+        from src.dashboard.frame_pipeline import config_from_streamer, config_signature
+
+        if self._pipeline is not None:
+            if config_signature(config_from_streamer(self.streamer)) == self._pipeline.signature:
+                self._pipeline.num_frames = self.streamer.num_frames
+                self._pipeline.cancel()
+                self._pipeline.prefetch(0, self.streamer.timestamp_for)
+                self._start_finisher(0)
+                return
+            self._stop_pipeline()
+        self._start_pipeline()
+
+    def _start_finisher(self, start_idx: int):
+        from src.dashboard.frame_pipeline import FrameFinisher
+
+        self._stop_finisher()
+        self._finisher = FrameFinisher(
+            self._pipeline, self.streamer, start_idx, self.streamer.timestamp_for,
+            lambda: self._achieved_fps)
+
+    def _stop_finisher(self):
+        """Must run before the tracker is replaced or the pipeline is changed."""
+        if getattr(self, "_finisher", None) is not None:
+            self._finisher.stop()
+            self._finisher = None
+
+    def _stop_pipeline(self):
+        self._stop_finisher()
+        if self._pipeline is not None:
+            try:
+                self._pipeline.shutdown()
+            except Exception:
+                pass
+            self._pipeline = None
+
+    def _compute_new_frame(self, idx: int, ts: float):
+        """FrameState for a frame not computed before: from the worker pool when
+        active (then tracked here, in frame order), else fully sequential."""
+        pipe = self._pipeline
+        if pipe is not None:
+            try:
+                state, ego = self._finisher.get(idx)
+                from src.dashboard.frame_pipeline import _NO_EGO
+
+                if ego is not _NO_EGO:
+                    self._last_ego_motion_m = ego
+                    self._last_ego_frame = idx
+                return state
+            except Exception as exc:
+                print(f"[WARNING] Frame pipeline failed ({exc!r}); continuing sequentially.")
+                self._stop_pipeline()
+        state = self.streamer.process_frame(idx, ts, fps=self._achieved_fps)
+        # Informational-only real ego-displacement estimate, computed against
+        # the immediately preceding REAL frame's real points (never fabricated),
+        # throttled per the comment in __init__.
+        if idx > 0 and idx % self._ego_motion_every_n_frames == 0 and (idx - 1) in self._frame_cache:
+            try:
+                from src.perception.ego_motion_estimate import estimate_relative_displacement_m
+                prev_pts = self._frame_cache[idx - 1].points[:, :3]
+                self._last_ego_motion_m = estimate_relative_displacement_m(prev_pts, state.points[:, :3])
+            except Exception:
+                self._last_ego_motion_m = None
+            self._last_ego_frame = idx
+        return state
 
     def _send_camera_command(self, cmd: str):
         """Forward a real camera command (from the dashboard's left panel)
@@ -299,9 +506,49 @@ class DashboardApplication:
         
         # Default view on switch: Traversability
         # so the difference (non-drivable cells) is immediately visible
-        self.qt_window._on_map_type_clicked("traversability")
+        self.qt_window._on_map_type_clicked("traversability") if hasattr(self.qt_window, '_on_map_type_clicked') else self.qt_window._on_map_changed("traversability")
         self.qt_window.set_active_environment(seq)
         self._restart()
+
+    def _load_custom_dataset(self, fmt, data_root, seq, kwargs):
+        """Load a user-selected dataset and restart the dashboard."""
+        from pathlib import Path
+        self.streamer.source = fmt
+        self.streamer.data_root = Path(data_root) if data_root else None
+        self.streamer.sequence = seq
+        
+        # Apply overhead clearance parameters
+        self.streamer.ground_noise_m = float(kwargs.get("ground_noise_m", 0.30))
+        self.streamer.clearance_threshold_m = float(kwargs.get("clearance_threshold_m", 2.0))
+        self.streamer.overhead_min_points = int(kwargs.get("min_points", 4))
+
+        # Apply detector clustering & voxel parameters
+        det = self.streamer.detector
+        if hasattr(det, "cluster_min_points"):
+            det.cluster_min_points = int(kwargs.get("cluster_min_points", kwargs.get("min_points", 5)))
+        if hasattr(det, "voxel_size_m"):
+            det.voxel_size_m = float(kwargs.get("voxel_size_m", 0.2))
+        if hasattr(det, "ground_threshold_m"):
+            det.ground_threshold_m = float(kwargs.get("ground_threshold_m", 0.25))
+
+        import src.perception.overhead_detection as od
+        if hasattr(od, "DEFAULT_GROUND_NOISE_M"):
+            od.DEFAULT_GROUND_NOISE_M = self.streamer.ground_noise_m
+        if hasattr(od, "DEFAULT_MIN_POINTS"):
+            od.DEFAULT_MIN_POINTS = self.streamer.overhead_min_points
+        if hasattr(od, "DEFAULT_CLEARANCE_THRESHOLD_M"):
+            od.DEFAULT_CLEARANCE_THRESHOLD_M = self.streamer.clearance_threshold_m
+            
+        self.streamer._setup_sources()
+        available = self.streamer.available_frames()
+        if available:
+            self.streamer.num_frames = available
+            
+        self.qt_window._on_map_changed("traversability")
+        self.qt_window.set_active_environment("CUSTOM")
+        self.qt_window.set_dataset_banner(f"Dataset: {fmt}, {self.streamer.num_frames:,} frames (loaded by user)")
+        self._restart()
+
 
     def _restart(self):
         """Reset the curated real playback to frame 0 with completely
@@ -316,22 +563,31 @@ class DashboardApplication:
         frame index.
         """
         self.playback_timer.stop()
+        self._stop_finisher()  # it owns the tracker while it runs
         from src.tracking.multi_object_tracker import MultiObjectTracker
         self.streamer.tracker = MultiObjectTracker()
+        self.streamer.reset_caches()
         self._frame_cache.clear()
+        self._reset_pipeline()
+        self._frame_render_times.clear()
+        self._achieved_fps = self._rate_hz
         self._playback_idx = -1
         self._last_ego_motion_m = None
+        self._last_ego_frame = None
         self._show_frame(0)
         self._playing = True
         self.qt_window.set_play_pause_state(True)
         self.playback_timer.start()
 
     def _on_timer_tick(self):
-        if not self._playing:
-            return
-        if self._playback_idx + 1 >= self.streamer.num_frames:
-            return  # real sequence exhausted; hold on the last real frame
-        self._show_frame(self._playback_idx + 1)
+        t0 = time.perf_counter()
+        if self._playing and self._playback_idx + 1 < self.streamer.num_frames:
+            # (past the last real frame we simply hold on it)
+            self._show_frame(self._playback_idx + 1)
+        # Wait only for what remains of this frame's budget; a frame that already
+        # overran it starts the next one immediately. Nothing is skipped.
+        budget_ms = 1000.0 / self._rate_hz
+        self.playback_timer.start(max(0, int(round(budget_ms - (time.perf_counter() - t0) * 1000.0))))
 
     def _show_frame(self, idx: int):
         """Compute (or replay from cache) the real frame at *idx* and push
@@ -342,39 +598,55 @@ class DashboardApplication:
             return  # already showing this exact real frame
 
         went_backward = idx < self._playback_idx
+        if went_backward and idx not in self._frame_cache:
+            # Older than the kept history: recomputing it now would run the
+            # tracker backward in time and corrupt its state, so stay put.
+            print(f"[INFO] Frame {idx + 1} is older than the {self._frame_cache_max} kept frames; "
+                  "cannot step back that far.")
+            return
         self._playback_idx = idx
+
+        import time
+        now = time.perf_counter()
+        self._frame_render_times.append(now)
+        if len(self._frame_render_times) > 15:
+            self._frame_render_times.pop(0)
+        if len(self._frame_render_times) >= 2:
+            dt = self._frame_render_times[-1] - self._frame_render_times[0]
+            if dt > 0:
+                self._achieved_fps = (len(self._frame_render_times) - 1) / dt
+        else:
+            self._achieved_fps = self._rate_hz
 
         if idx in self._frame_cache:
             state = self._frame_cache[idx]
         else:
-            ts = idx / self._rate_hz
-            state = self.streamer.process_frame(idx, ts, fps=self._rate_hz)
+            ts = self.streamer.timestamp_for(idx)
+            state = self._compute_new_frame(idx, ts)
             self._frame_cache[idx] = state
+            while len(self._frame_cache) > self._frame_cache_max:
+                del self._frame_cache[min(self._frame_cache)]
 
-            # Informational-only real ego-displacement estimate, computed
-            # against the immediately preceding REAL frame's real points
-            # (never fabricated), throttled per the comment in __init__.
-            if idx > 0 and idx % self._ego_motion_every_n_frames == 0 and (idx - 1) in self._frame_cache:
-                try:
-                    from src.perception.ego_motion_estimate import estimate_relative_displacement_m
-                    prev_pts = self._frame_cache[idx - 1].points[:, :3]
-                    curr_pts = state.points[:, :3]
-                    self._last_ego_motion_m = estimate_relative_displacement_m(prev_pts, curr_pts)
-                except Exception:
-                    self._last_ego_motion_m = None
-
-        # Push the identical FrameState to the 3D process and to every 2D
-        # panel -- no independent throttling, so nothing can lag behind.
+        # The 3D process draws this same frame's tracks, over a voxel-thinned copy
+        # of the cloud (display only; the 2D panels and every metric use all
+        # points). Only what it reads is sent, not the whole FrameState.
         try:
+            from src.dashboard.dashboard_state import FrameState
+
+            slim = FrameState(
+                frame_idx=state.frame_idx, timestamp_s=state.timestamp_s, tracks=state.tracks,
+                points=state.display_points if state.display_points is not None else state.points,
+            )
             if self.o3d_queue.full():
                 self.o3d_queue.get_nowait()
-            self.o3d_queue.put_nowait(state)
+            self.o3d_queue.put_nowait(slim)
         except Exception:
             pass
 
         self.qt_window.update_ui(state)
         self.qt_window.set_frame_counter(idx + 1, self.streamer.num_frames)
-        self.qt_window.set_ego_motion_estimate(self._last_ego_motion_m)
+        self.qt_window.set_ego_motion_estimate(
+            self._last_ego_motion_m, self._last_ego_frame, self._ego_motion_every_n_frames)
 
         if went_backward:
             print(f"[INFO] Stepped back to real frame {idx + 1}/{self.streamer.num_frames} "
@@ -545,6 +817,7 @@ class DashboardApplication:
 
         # Cleanup
         self.playback_timer.stop()
+        self._stop_pipeline()
         self.o3d_queue.put("QUIT")
         self.o3d_process.join(timeout=2.0)
         if self.o3d_process.is_alive():
@@ -571,6 +844,8 @@ def run_headless(args):
         num_frames=args.frames,
         sequence=seq,
         rate_hz=args.rate_hz,
+        lidar_source=getattr(args, "lidar_source", None),
+        sensor_hz=getattr(args, "sensor_hz", None),
     )
     streamer._setup_sources()
 
@@ -578,7 +853,7 @@ def run_headless(args):
     start_time = time.time()
 
     for idx in range(args.frames):
-        ts = idx * dt
+        ts = streamer.timestamp_for(idx)
         t0 = time.perf_counter()
         state = streamer.process_frame(idx, ts, fps=args.rate_hz)
         latency = (time.perf_counter() - t0) * 1000.0
@@ -639,6 +914,8 @@ def run_profile(args):
         source=args.source, detector=detector, num_frames=total_frames, sequence=seq,
         rate_hz=args.rate_hz, semantic_predictor=semantic_predictor,
         predictor_mode=args.predictor,
+        lidar_source=getattr(args, "lidar_source", None),
+        sensor_hz=getattr(args, "sensor_hz", None),
     )
     streamer._setup_sources()
 
@@ -694,7 +971,7 @@ def run_profile(args):
             t_measured_start = time.perf_counter()
 
         with timer.time("frame_total"):
-            ts = idx / args.rate_hz
+            ts = streamer.timestamp_for(idx)
             t_pf = time.perf_counter()
             state = streamer.process_frame(idx, ts, fps=args.rate_hz)
             if idx >= warmup:
@@ -781,7 +1058,19 @@ def run_profile(args):
 
 def main():
     args = parse_args()
-    if args.profile:
+    resolve_input(args)
+    from src.dashboard.profiles import apply_profile
+    apply_profile(args)
+    print(f"[INFO] Launch profile: {args.dataset_profile}  |  data: "
+          f"{args.data_root if args.data_root else args.source}  |  sequence: {args.sequence}  |  "
+          f"frames: {args.frames}  |  target rate: {args.rate_hz:g} Hz")
+    if args.golden_check:
+        from src.dashboard.golden_check import run_golden_check
+        sys.exit(run_golden_check(args))
+    if args.bench_frames:
+        from src.dashboard.gui_bench import run_gui_bench
+        run_gui_bench(DashboardApplication(args), args.bench_frames)
+    elif args.profile:
         run_profile(args)
     elif args.headless:
         run_headless(args)

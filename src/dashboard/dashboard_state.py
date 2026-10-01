@@ -99,8 +99,13 @@ class FrameState:
     predictor_mode: str = "ground_truth"
     accuracy_metrics: dict | None = None
 
+    # DISPLAY ONLY: a voxel-thinned copy of `points` that is sent to the Open3D
+    # 3D view (fewer points to draw). Every perception stage, count and metric
+    # uses the full `points`. None when thinning is disabled.
+    display_points: np.ndarray | None = None
 
-def assert_coordinate_frame_consistency(frame_state: "FrameState") -> list[str]:
+
+def assert_coordinate_frame_consistency(frame_state: "FrameState", point_bounds=None) -> list[str]:
     """
     Coarse sanity check that raw_points, grid_cells, and tracks in a
     FrameState share a consistent ego-centered coordinate convention.
@@ -109,6 +114,10 @@ def assert_coordinate_frame_consistency(frame_state: "FrameState") -> list[str]:
     or block rendering -- callers should log and surface warnings instead.
     This is not a frame-transform validation (that's tf2's job in Phase 10);
     it's a coarse offline/dashboard-context sanity check.
+
+    `point_bounds` is an optional precomputed (min_xy, max_xy) of the point
+    cloud (what a worker process computes next to the other per-frame work);
+    the result is identical to computing it here from `frame_state.points`.
     """
     warnings_found: list[str] = []
     points = frame_state.points
@@ -123,8 +132,11 @@ def assert_coordinate_frame_consistency(frame_state: "FrameState") -> list[str]:
 
     p_min = p_max = None
     if len(points) > 0:
-        p_min = np.min(points[:, :2], axis=0)
-        p_max = np.max(points[:, :2], axis=0)
+        if point_bounds is not None:
+            p_min, p_max = point_bounds
+        else:
+            p_min = np.min(points[:, :2], axis=0)
+            p_max = np.max(points[:, :2], axis=0)
 
         if has_grid and (p_max[0] < x_min or p_min[0] > x_max or p_max[1] < y_min or p_min[1] > y_max):
             warnings_found.append(

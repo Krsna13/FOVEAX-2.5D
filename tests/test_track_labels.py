@@ -336,6 +336,16 @@ class TestQtOverlay:
         assert set(widget._label_widgets) == {2}
         assert widget.visible_label_texts() == {2: "B (Static)"}
 
+    def test_label_window_is_reused_for_a_new_track(self, widget):
+        """Creating a native window per new track was a measurable per-frame cost."""
+        widget.set_track_labels([self._label(1, "A (Static)")])
+        first = widget._label_widgets[1]
+        widget.set_track_labels([])
+        assert 1 not in widget._label_widgets and not first.isVisible()
+        widget.set_track_labels([self._label(2, "B (Static)", dynamic=True)])
+        assert widget._label_widgets[2] is first
+        assert widget.visible_label_texts() == {2: "B (Static)"}
+
     def test_text_updates_when_track_status_changes(self, widget):
         widget.set_track_labels([self._label(5, "VEHICLE (Static)")])
         widget.set_track_labels([self._label(5, "VEHICLE (Dynamic)", dynamic=True)])

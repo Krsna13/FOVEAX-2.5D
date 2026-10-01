@@ -1,3 +1,4 @@
+import dataclasses
 import math
 import time
 from contextlib import nullcontext
@@ -29,6 +30,20 @@ try:
 except ImportError:
     HAS_RELLIS_LOADER = False
 
+def _snapshot_track(t):
+    """An independent copy of a TrackState.
+
+    MultiObjectTracker.update() returns a new list but the SAME TrackState
+    objects, which it keeps updating in place on later frames. A FrameState
+    holding them would change retroactively (a frame cached for STEP back would
+    show later positions, and a reader on another thread would see an object
+    mid-update). Each frame therefore keeps its own copy.
+    """
+    return dataclasses.replace(
+        t, state=t.state.copy(), covariance=t.covariance.copy(),
+        size_lwh=t.size_lwh.copy(), metadata=dict(t.metadata))
+
+
 class DataStreamerThread(QThread):
     state_ready = pyqtSignal(FrameState)
     
@@ -42,9 +57,14 @@ class DataStreamerThread(QThread):
         rate_hz: float = 10.0,
         semantic_predictor: Any = None,
         predictor_mode: str = "ground_truth",
+        lidar_source: Any = None,
+        sensor_hz: float | None = None,
     ):
         super().__init__()
-        self.source = source.lower()
+        # Optional src.inputs.LidarSource (any dataset/sensor via a config file).
+        # When set it replaces the built-in sample/semantickitti/rellis3d readers.
+        self.lidar_source = lidar_source
+        self.source = "custom" if lidar_source is not None else source.lower()
         self.detector = detector if detector else MockObjectDetector()
         self.semantic_predictor = semantic_predictor
         # "ground_truth" | "mock" | "salsanext" -- matches
@@ -58,7 +78,17 @@ class DataStreamerThread(QThread):
         self.sequence = sequence
         self.data_root = Path(data_root) if data_root else None
         self.rate_hz = rate_hz
+        # Scan rate of the SENSOR that recorded the data. Timestamps (and so the
+        # tracker's m/s speeds) come from this, not from rate_hz, which is only
+        # how fast the replay is played back.
+        self.sensor_hz = float(sensor_hz if sensor_hz is not None
+                               else (lidar_source.sensor_hz if lidar_source is not None else 10.0))
         self.running = True
+        self.ground_noise_m: float = 0.30
+        self.clearance_threshold_m: float = 2.0
+        self.overhead_min_points: int = 4
+        # Voxel size (m) of the display-only thinned cloud sent to the 3D view; 0 disables.
+        self.display_voxel_m: float = 0.15
         
         # Grid parameters for 2D maps
         self.grid_res = 0.5
@@ -66,39 +96,19 @@ class DataStreamerThread(QThread):
         self.x_bins = int((self.grid_extent[1] - self.grid_extent[0]) / self.grid_res)
         self.y_bins = int((self.grid_extent[3] - self.grid_extent[2]) / self.grid_res)
 
-        # OPT-12: Pre-allocate reusable flat grid buffers so _generate_maps
-        # never allocates them from scratch each frame.
-        _tc = self.y_bins * self.x_bins
-        self._z_max_buf = np.empty(_tc, dtype=np.float32)
-        self._z_min_buf = np.empty(_tc, dtype=np.float32)
-        self._cnt_buf   = np.empty(_tc, dtype=np.float32)
-
-        # OPT-2: Cache the accuracy-metrics module at init time so
-        # _compute_live_accuracy never calls importlib.import_module per frame.
+        # Cache the accuracy-metrics module once (importing it per frame is wasted work).
         try:
             self._eval_module = importlib.import_module("src.10b_eval_distance_metrics")
         except Exception:
             self._eval_module = None
 
-        # OPT-3: Throttle hazard cluster computation (scipy ndimage.label +
-        # binary dilation) -- recompute every N frames, serve cached otherwise.
-        self._hazard_cache: dict = {"clusters": [], "frame_idx": -999}
-        self._hazard_recompute_every_n: int = 3
-
-        # OPT-4: Throttle centerline profile computation -- recompute every 2
-        # frames, serve cached on alternating frames.
-        self._centerline_cache = None
-        self._centerline_frame_idx: int = -999
-        self._centerline_recompute_every_n: int = 2
-
-        # OPT-14: Cache hardware metrics (psutil/pynvml) for up to 100 ms so
-        # per-frame system calls don't dominate the metric path.
+        # Hardware telemetry is sampled at most every 100 ms (psutil/pynvml are
+        # system calls); each frame still gets its own HardwareMetrics object.
         self._last_hw_time: float = 0.0
         self._last_hw_snapshot: HardwareMetrics | None = None
-
-        # OPT-15: Track the current frame index inside _generate_maps so
-        # throttle caches can reference it without an extra argument.
-        self._current_frame_idx: int = 0
+        self._last_extras: dict = {}
+        self._log_fh = None
+        self._log_writes = 0
 
         global HAS_PYNVML
         
@@ -107,6 +117,14 @@ class DataStreamerThread(QThread):
                 pynvml.nvmlInit()
             except pynvml.NVMLError:
                 HAS_PYNVML = False
+
+    def reset_caches(self):
+        """Forget per-run state so nothing bleeds into a new sequence.
+
+        Every perception stage is now recomputed from scratch for each frame
+        (no throttled/cached stage), so only the last-extras scratch remains.
+        """
+        self._last_extras = {}
 
     def _attach_terrain_features(self, detections: list, points: np.ndarray) -> None:
         """Compute real geometric features per detection and stash them in
@@ -154,25 +172,7 @@ class DataStreamerThread(QThread):
 
         ground_like = {"DRIVABLE_GROUND", "ROUGH_TERRAIN"}
 
-        # OPT-13: Skip expensive O(N) terrain-feature computation for detections
-        # that are far from the ego AND belong to classes that cannot move.
-        # These are static background clusters (vegetation, walls) whose terrain
-        # features are informational only -- no traversability or safety decision
-        # depends on the exact slope/clearance of a tree 12 m away.
-        _SKIP_FAR_DISTANCE_M = 8.0
-        _STATIC_SKIP_CLASSES = {
-            "VEGETATION", "BUILDING_WALL", "SOLID_OBSTACLE",
-        }
-
         for d in detections:
-            # Fast distance check before any heavy work.
-            dist_sq = float(d.center_xyz[0]**2 + d.center_xyz[1]**2)
-            if (d.class_name in _STATIC_SKIP_CLASSES
-                    and dist_sq > _SKIP_FAR_DISTANCE_M ** 2):
-                # Leave metadata empty -- treated as "no terrain features"
-                # downstream, exactly as if the detection had too few points.
-                continue
-
             member_mask = points_in_oriented_box(points, d.center_xyz, d.size_lwh)
             member_xyz = points[member_mask, :3]
             metadata: dict = {}
@@ -196,14 +196,60 @@ class DataStreamerThread(QThread):
 
             d.metadata.update(metadata)
 
+    # ------------------------------------------------------------------
+    # 2.5D grid maps, split in two so the expensive, tracker-independent part
+    # can run in a worker process (src/dashboard/frame_pipeline.py) while the
+    # cheap part that needs this frame's tracks runs in the main process:
+    #   _grid_base(points)        elevation / traversability / uncertainty /
+    #                             overhead grids, road width, elevation
+    #                             profile, hazard clusters, corridor profile
+    #   _finish_grids(base, tracks)  ROI layer + corridor object markers
+    # _generate_maps(points, tracks) runs both (the original entry point).
+    # ------------------------------------------------------------------
     def _generate_maps(self, points: np.ndarray, tracks: list) -> dict:
-        """Generate simple 2D grid maps for dashboard visualization.
+        """Generate the 2D grid maps for dashboard visualization."""
+        return self._finish_grids(self._grid_base(points), tracks)
 
-        OPT-15: Accepts a (possibly voxel-downsampled) point cloud for the
-        grid aggregation path.  The full cloud is still used by the caller
-        for detection/tracking; only the grid ops benefit from the reduced
-        point count.
-        """
+    def _display_downsample(self, points: np.ndarray):
+        """Voxel-thinned copy of the cloud for the 3D VIEW ONLY (see
+        FrameState.display_points). Perception never sees it."""
+        try:
+            voxel = float(self.display_voxel_m)
+        except (AttributeError, RuntimeError):
+            voxel = 0.15
+        if voxel <= 0.0 or len(points) == 0:
+            return None
+        try:
+            import open3d as o3d
+
+            # Empty (0, 0, 0) "no return" padding is not a real point, so it is
+            # left out of the picture (the full cloud is untouched elsewhere).
+            real = points[(points[:, :3] != 0).any(axis=1), :3]
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(real.astype(np.float64))
+            xyz = np.asarray(pcd.voxel_down_sample(voxel).points, dtype=np.float32)
+        except ImportError:  # keep the first point of every occupied voxel
+            keys = np.floor(points[:, :3] / voxel).astype(np.int64)
+            _, first = np.unique(keys, axis=0, return_index=True)
+            xyz = points[np.sort(first), :3].astype(np.float32)
+        return np.column_stack([xyz, np.zeros(len(xyz), dtype=np.float32)])
+
+    def _overhead_params(self) -> dict:
+        """Overhead-detection thresholds with defaults. Reading attributes of a
+        Qt object whose constructor never ran raises RuntimeError (not
+        AttributeError), which tests that build a bare streamer rely on us
+        absorbing."""
+        out = {}
+        for kwarg, attr, default in (("min_points", "overhead_min_points", 4),
+                                     ("clearance_threshold_m", "clearance_threshold_m", 2.0),
+                                     ("ground_noise_m", "ground_noise_m", 0.30)):
+            try:
+                out[kwarg] = getattr(self, attr)
+            except (AttributeError, RuntimeError):
+                out[kwarg] = default
+        return out
+
+    def _grid_base(self, points: np.ndarray) -> dict:
         x = points[:, 0]
         y = points[:, 1]
         z = points[:, 2]
@@ -215,21 +261,10 @@ class DataStreamerThread(QThread):
         x, y, z = x[mask], y[mask], z[mask]
 
         if len(x) == 0:
-            empty = np.full((self.y_bins, self.x_bins), np.nan, dtype=np.float32)
-            empty_overhead = np.full((self.y_bins, self.x_bins), -1, dtype=np.int8)
-            self._last_extras = {
-                "road_width_m": None,
-                "elevation_profile": [],
-                "elevation_hazards_m": [],
-                "hazard_clusters": [],
-                "mean_uncertainty": None,
-                "occupied_fraction": None,
-                "centerline_profile": [],
-                "centerline_markers": [],
-            }
             return {
-                "elevation": empty, "traversability": empty, "roi": empty,
-                "uncertainty": empty, "overhead": empty_overhead,
+                "empty": True,
+                "empty_grid": np.full((self.y_bins, self.x_bins), np.nan, dtype=np.float32),
+                "empty_overhead": np.full((self.y_bins, self.x_bins), -1, dtype=np.int8),
             }
 
         col = np.floor((x - x_min) / self.grid_res).astype(np.int32)
@@ -241,30 +276,17 @@ class DataStreamerThread(QThread):
         flat_idx = row * self.x_bins + col
 
         total_cells = self.y_bins * self.x_bins
-
-        # OPT-12: Reuse pre-allocated flat buffers (set in __init__) instead of
-        # allocating fresh arrays every frame.  np.full(..., -inf) over 6400
-        # elements is cheap but doing it zero-allocation is still faster.
-        try:
-            z_max_arr = self._z_max_buf
-            z_min_arr = self._z_min_buf
-            if len(z_max_arr) != total_cells:
-                raise AttributeError
-        except (AttributeError, RuntimeError):
-            z_max_arr = np.empty(total_cells, dtype=np.float32)
-            z_min_arr = np.empty(total_cells, dtype=np.float32)
-            try:
-                self._z_max_buf = z_max_arr
-                self._z_min_buf = z_min_arr
-            except Exception:
-                pass
-
-        z_max_arr[:] = -np.inf
+        # Fresh arrays every frame: a reused buffer would be overwritten by the
+        # next frame while earlier FrameStates (cached for STEP back, or in
+        # flight to a display process) still point into it.
+        z_max_arr = np.full(total_cells, -np.inf, dtype=np.float32)
         np.maximum.at(z_max_arr, flat_idx, z)
         z_max_arr[z_max_arr == -np.inf] = np.nan
+
         elevation = z_max_arr.reshape(self.y_bins, self.x_bins)
 
-        z_min_arr[:] = np.inf
+        # Traversability mock: High if elevation variance is high
+        z_min_arr = np.full(total_cells, np.inf, dtype=np.float32)
         np.minimum.at(z_min_arr, flat_idx, z)
         z_min_arr[z_min_arr == np.inf] = np.nan
         z_min_arr = z_min_arr.reshape(self.y_bins, self.x_bins)
@@ -286,8 +308,53 @@ class DataStreamerThread(QThread):
         point_count_2d = point_count.reshape(self.y_bins, self.x_bins)
         occupied_2d = occupied.reshape(self.y_bins, self.x_bins)
 
+        extras = self._compute_real_extras(
+            traversability, elevation, z_min_arr, point_count_2d, occupied_2d, uncertainty
+        )
+
+        # Overhead-clearance classification (EV-2): per-cell, from this
+        # frame's real raw point z-values only -- distinguishes a genuine
+        # vertical gap under a raised obstacle (overhead_obstacle) from a
+        # column solid all the way to the ground (solid_obstacle). See
+        # src/perception/overhead_detection.py for the algorithm.
+        from src.perception.overhead_detection import compute_overhead_clearance_grid
+        overhead = compute_overhead_clearance_grid(
+            x, y, z, x_min, y_min, self.x_bins, self.y_bins, self.grid_res,
+            **self._overhead_params(),
+        )
+
+        # Flip vertically so row 0 is max Y (top of image)
+        return {
+            "empty": False,
+            "elevation": np.flipud(elevation),
+            "traversability": np.flipud(traversability),
+            "uncertainty": np.flipud(uncertainty),
+            "overhead": np.flipud(overhead),
+            "extras": extras,
+        }
+
+    def _finish_grids(self, base: dict, tracks: list) -> dict:
+        """Add the track-dependent parts (ROI layer, corridor object markers)."""
+        x_min, x_max, y_min, y_max = self.grid_extent
+        if base["empty"]:
+            empty = base["empty_grid"]
+            self._last_extras = {
+                "road_width_m": None,
+                "elevation_profile": [],
+                "elevation_hazards_m": [],
+                "hazard_clusters": [],
+                "mean_uncertainty": None,
+                "occupied_fraction": None,
+                "centerline_profile": [],
+                "centerline_markers": [],
+            }
+            return {
+                "elevation": empty, "traversability": empty, "roi": empty,
+                "uncertainty": empty, "overhead": base["empty_overhead"],
+            }
+
         # ROI mock: higher around dynamic objects
-        roi = np.zeros_like(elevation)
+        roi = np.zeros((self.y_bins, self.x_bins), dtype=np.float32)
         for t in tracks:
             if t.dynamic:
                 tx, ty = t.state[0], t.state[1]
@@ -301,28 +368,38 @@ class DataStreamerThread(QThread):
                             if 0 <= r < self.y_bins and 0 <= c < self.x_bins:
                                 roi[r, c] = max(roi[r, c], 1.0 - 0.2*max(abs(i), abs(j)))
 
-        self._last_extras = self._compute_real_extras(
-            traversability, elevation, z_min_arr, point_count_2d, occupied_2d, uncertainty, tracks
-        )
+        extras = dict(base["extras"])
+        extras["centerline_markers"] = self._corridor_markers(extras["hazard_clusters"], tracks)
+        self._last_extras = extras
 
-        # Overhead-clearance classification (EV-2): per-cell, from this
-        # frame's real raw point z-values only -- distinguishes a genuine
-        # vertical gap under a raised obstacle (overhead_obstacle) from a
-        # column solid all the way to the ground (solid_obstacle). See
-        # src/perception/overhead_detection.py for the algorithm.
-        from src.perception.overhead_detection import compute_overhead_clearance_grid
-        overhead = compute_overhead_clearance_grid(
-            x, y, z, x_min, y_min, self.x_bins, self.y_bins, self.grid_res
-        )
-
-        # Flip vertically so row 0 is max Y (top of image)
         return {
-            "elevation": np.flipud(elevation),
-            "traversability": np.flipud(traversability),
+            "elevation": base["elevation"],
+            "traversability": base["traversability"],
             "roi": np.flipud(roi),
-            "uncertainty": np.flipud(uncertainty),
-            "overhead": np.flipud(overhead),
+            "uncertainty": base["uncertainty"],
+            "overhead": base["overhead"],
         }
+
+    def _corridor_markers(self, hazard_clusters: list, tracks: list) -> list:
+        """Hazard + tracked-object markers along the forward corridor."""
+        from src.perception.centerline_profile import find_corridor_markers
+
+        y_max = self.grid_extent[3]
+        corridor_objects = list(hazard_clusters)
+        for t in tracks:
+            tx, ty = float(t.state[0]), float(t.state[1])
+            corridor_objects.append({
+                "x": tx, "y": ty,
+                "distance_m": round(float(np.hypot(tx, ty)), 2),
+                "label": t.class_name,
+                "type": "track",
+                "track_id": t.track_id,
+            })
+        return find_corridor_markers(
+            corridor_objects, self.grid_extent,
+            ego_position=(0.0, 0.0), ego_heading_rad=math.pi / 2.0,
+            width_m=2.0, max_range_m=y_max,
+        )
 
     def _compute_real_extras(
         self,
@@ -332,10 +409,11 @@ class DataStreamerThread(QThread):
         point_count_2d: np.ndarray,
         occupied_2d: np.ndarray,
         uncertainty_2d: np.ndarray,
-        tracks: list,
     ) -> dict:
-        """Compute road width, elevation profile, hazard clusters and the
-        Phase 5 uncertainty summary from the real (pre-flip) local grid.
+        """Compute road width, elevation profile, hazard clusters, the Phase 5
+        uncertainty summary and the corridor profile from the real (pre-flip)
+        local grid. `centerline_markers` needs the tracks, so it is a
+        placeholder here and filled in by _finish_grids.
 
         All arrays are indexed [row=y, col=x] over self.grid_extent, not yet
         flipped for display -- kept that way here so real-world x/y math
@@ -368,157 +446,105 @@ class DataStreamerThread(QThread):
 
         # --- Elevation profile + hazard markers along the ego-forward
         # centerline (column nearest x=0), real z_max per row.
-        # OPT-11: Fully vectorised -- eliminates the original Python
-        # `for r in range(y_bins):` loop (80 iterations with per-iteration
-        # np.isnan checks) in favour of one NumPy boolean mask + list(zip).
         centerline_col = ego_col
-        _r_idx   = np.arange(self.y_bins)
-        _z_col   = elevation[:, centerline_col]          # shape (y_bins,)
-        _t_col   = traversability[:, centerline_col]
-        _y_world = y_min + (_r_idx + 0.5) * self.grid_res
-        _valid_z = ~np.isnan(_z_col)
-        elevation_profile = list(zip(
-            _y_world[_valid_z].tolist(),
-            _z_col[_valid_z].tolist(),
-        ))
-        _hz_mask = _valid_z & ~np.isnan(_t_col) & (_t_col < 0.40)
-        elevation_hazards_m = _y_world[_hz_mask].tolist()
+        elevation_profile = []
+        elevation_hazards_m = []
+        for r in range(self.y_bins):
+            z = elevation[r, centerline_col]
+            if not np.isnan(z):
+                y_world = y_min + (r + 0.5) * self.grid_res
+                elevation_profile.append((float(y_world), float(z)))
+                t = traversability[r, centerline_col]
+                if not np.isnan(t) and t < 0.40:
+                    elevation_hazards_m.append(float(y_world))
 
         # --- Hazard clusters: connected components of Blocked (<0.40)
         # cells, same method as export_web_dashboard_data.find_hazard_clusters.
-        # OPT-3: Throttle scipy ndimage.label + binary_dilation to every
-        # _hazard_recompute_every_n frames.  Between recomputes, the cached
-        # result is returned unchanged -- hazard topology evolves slowly
-        # (terrain features, not fast-moving objects) so stale-by-2-frames
-        # clusters are indistinguishable visually.
+        hazard_clusters = []
         try:
-            _fidx = self._current_frame_idx
-            _hazard_cache = self._hazard_cache
-            _hazard_recompute_every_n = self._hazard_recompute_every_n
-        except (AttributeError, RuntimeError):
-            _fidx = 0
-            _hazard_cache = {"clusters": [], "frame_idx": -999}
-            _hazard_recompute_every_n = 1
+            from scipy import ndimage
 
-        _frames_since = _fidx - _hazard_cache["frame_idx"]
-        if _frames_since < _hazard_recompute_every_n:
-            hazard_clusters = _hazard_cache["clusters"]
-        else:
-            hazard_clusters = []
-            try:
-                from scipy import ndimage
-                from src.perception.terrain_features import classify_hazard_kind
+            from src.perception.terrain_features import classify_hazard_kind
 
-                blocked = np.nan_to_num(traversability, nan=1.0) < 0.40
-                labeled, n_clusters = ndimage.label(blocked)
-                cell_area_m2 = self.grid_res ** 2
-                for cluster_id in range(1, n_clusters + 1):
-                    cmask = labeled == cluster_id
-                    rows_idx, cols_idx = np.nonzero(cmask)
-                    if len(rows_idx) == 0:
-                        continue
-                    min_trav = float(np.nanmin(traversability[cmask]))
-                    mean_density = float(point_count_2d[cmask].mean())
-                    confidence = float(np.clip(mean_density / 20.0, 0.0, 1.0))
-                    centroid_row = float(rows_idx.mean())
-                    centroid_col = float(cols_idx.mean())
-                    world_x = x_min + (centroid_col + 0.5) * self.grid_res
-                    world_y = y_min + (centroid_row + 0.5) * self.grid_res
-                    distance_m = float(np.hypot(world_x, world_y))
-                    severity = "Critical" if min_trav < 0.20 else "Caution"
+            blocked = np.nan_to_num(traversability, nan=1.0) < 0.40
+            labeled, n_clusters = ndimage.label(blocked)
+            cell_area_m2 = self.grid_res ** 2
+            for cluster_id in range(1, n_clusters + 1):
+                cmask = labeled == cluster_id
+                rows_idx, cols_idx = np.nonzero(cmask)
+                if len(rows_idx) == 0:
+                    continue
+                min_trav = float(np.nanmin(traversability[cmask]))
+                mean_density = float(point_count_2d[cmask].mean())
+                confidence = float(np.clip(mean_density / 20.0, 0.0, 1.0))
+                centroid_row = float(rows_idx.mean())
+                centroid_col = float(cols_idx.mean())
+                world_x = x_min + (centroid_col + 0.5) * self.grid_res
+                world_y = y_min + (centroid_row + 0.5) * self.grid_res
+                distance_m = float(np.hypot(world_x, world_y))
+                severity = "Critical" if min_trav < 0.20 else "Caution"
 
-                    dilated = ndimage.binary_dilation(cmask, iterations=2)
-                    ring = dilated & ~cmask & occupied_2d
-                    baseline_z = float(np.nanmedian(elevation[ring])) if np.any(ring) else None
-                    z_max_local = float(np.nanmax(elevation[cmask]))
-                    z_min_local = float(np.nanmin(z_min_2d[cmask]))
-                    kind, extent_m = classify_hazard_kind(z_max_local, z_min_local, baseline_z)
+                # Real Pothole/Bump classification: this cluster's own real
+                # min/max elevation vs. a real local baseline taken from the
+                # real occupied ring of cells immediately around it
+                # (dilate minus the cluster itself) -- never the cluster's
+                # own cells, or a dip would be compared against itself.
+                dilated = ndimage.binary_dilation(cmask, iterations=2)
+                ring = dilated & ~cmask & occupied_2d
+                baseline_z = float(np.nanmedian(elevation[ring])) if np.any(ring) else None
+                z_max_local = float(np.nanmax(elevation[cmask]))
+                z_min_local = float(np.nanmin(z_min_2d[cmask]))
+                kind, extent_m = classify_hazard_kind(z_max_local, z_min_local, baseline_z)
 
-                    hazard_clusters.append({
-                        "cluster_id": cluster_id,
-                        "x": round(world_x, 3),
-                        "y": round(world_y, 3),
-                        "distance_m": round(distance_m, 2),
-                        "area_m2": round(len(rows_idx) * cell_area_m2, 2),
-                        "min_traversability": round(min_trav, 3),
-                        "severity": severity,
-                        "confidence": round(confidence, 3),
-                        "kind": kind,
-                        "extent_m": round(extent_m, 3) if extent_m is not None else None,
-                    })
-                hazard_clusters.sort(key=lambda c: c["distance_m"])
-            except ImportError:
-                pass
-            try:
-                self._hazard_cache = {"clusters": hazard_clusters, "frame_idx": _fidx}
-            except (AttributeError, RuntimeError):
-                pass
+                hazard_clusters.append({
+                    "cluster_id": cluster_id,
+                    "x": round(world_x, 3),
+                    "y": round(world_y, 3),
+                    "distance_m": round(distance_m, 2),
+                    "area_m2": round(len(rows_idx) * cell_area_m2, 2),
+                    "min_traversability": round(min_trav, 3),
+                    "severity": severity,
+                    "confidence": round(confidence, 3),
+                    "kind": kind,
+                    "extent_m": round(extent_m, 3) if extent_m is not None else None,
+                })
+            hazard_clusters.sort(key=lambda c: c["distance_m"])
+        except ImportError:
+            pass
 
-        # --- Uncertainty summary (Phase 5 formula, see _generate_maps).
+        # --- Uncertainty summary (Phase 5 formula, see _grid_base).
         occupied_fraction = float(occupied_2d.mean())
         mean_uncertainty = float(np.mean(uncertainty_2d))
 
         # --- Real forward-corridor cross-section (src/perception/centerline_profile.py).
-        # OPT-4: Throttle centerline profile computation to every
-        # _centerline_recompute_every_n frames.  The centerline changes
-        # slowly relative to fast terrain updates; serving a 1-frame-stale
-        # profile is visually indistinguishable at 30 Hz.
-        from src.perception.centerline_profile import (
-            compute_centerline_profile, find_corridor_markers,
+        # No existing ego heading/position tracking was found anywhere in
+        # this pipeline (checked dashboard_state.py, this module, and the
+        # tracker) -- every FrameState is a single ego-centered frame with
+        # no odometry. ego_position=(0,0) is the pipeline's established
+        # ego-origin convention; heading=+Y matches this module's own
+        # pre-existing forward-axis convention above (elevation_profile,
+        # road_width already treat y as the forward axis). Capped to this
+        # local grid's own 20m forward extent, not the function's 100m
+        # default, since this grid does not extend further.
+        from src.perception.centerline_profile import compute_centerline_profile
+        centerline = compute_centerline_profile(
+            elevation, z_min_2d, point_count_2d, self.grid_extent, self.grid_res,
+            ego_position=(0.0, 0.0), ego_heading_rad=math.pi / 2.0,
+            width_m=2.0, max_range_m=y_max, bin_size_m=1.0,
         )
-        try:
-            _fidx = self._current_frame_idx
-            _centerline_frame_idx = self._centerline_frame_idx
-            _centerline_recompute_every_n = self._centerline_recompute_every_n
-            _centerline_cache = self._centerline_cache
-        except (AttributeError, RuntimeError):
-            _fidx = 0
-            _centerline_frame_idx = -999
-            _centerline_recompute_every_n = 1
-            _centerline_cache = None
+        centerline_profile = [
+            {
+                "distance_m": b.distance_m,
+                "height_above_baseline_m": b.height_above_baseline_m,
+                "depth_below_baseline_m": b.depth_below_baseline_m,
+                "point_count": b.point_count,
+            }
+            for b in centerline.bins
+        ]
 
-        if (_fidx - _centerline_frame_idx >= _centerline_recompute_every_n
-                or _centerline_cache is None):
-            centerline = compute_centerline_profile(
-                elevation, z_min_2d, point_count_2d, self.grid_extent, self.grid_res,
-                ego_position=(0.0, 0.0), ego_heading_rad=math.pi / 2.0,
-                width_m=2.0, max_range_m=y_max, bin_size_m=1.0,
-            )
-            centerline_profile = [
-                {
-                    "distance_m": b.distance_m,
-                    "height_above_baseline_m": b.height_above_baseline_m,
-                    "depth_below_baseline_m": b.depth_below_baseline_m,
-                    "point_count": b.point_count,
-                }
-                for b in centerline.bins
-            ]
-            try:
-                self._centerline_cache = centerline_profile
-                self._centerline_frame_idx = _fidx
-            except (AttributeError, RuntimeError):
-                pass
-        else:
-            centerline_profile = _centerline_cache
-
-        corridor_objects = list(hazard_clusters)
-        for t in tracks:
-            tx, ty = float(t.state[0]), float(t.state[1])
-            corridor_objects.append({
-                "x": tx, "y": ty,
-                "distance_m": round(float(np.hypot(tx, ty)), 2),
-                "label": t.class_name,
-                "type": "track",
-                "track_id": t.track_id,
-            })
         for h in hazard_clusters:
             h.setdefault("label", h["severity"])
             h.setdefault("type", "hazard")
-        centerline_markers = find_corridor_markers(
-            corridor_objects, self.grid_extent,
-            ego_position=(0.0, 0.0), ego_heading_rad=math.pi / 2.0,
-            width_m=2.0, max_range_m=y_max,
-        )
 
         return {
             "road_width_m": road_width_m,
@@ -528,7 +554,7 @@ class DataStreamerThread(QThread):
             "occupied_fraction": occupied_fraction,
             "mean_uncertainty": mean_uncertainty,
             "centerline_profile": centerline_profile,
-            "centerline_markers": centerline_markers,
+            "centerline_markers": [],
         }
 
     def _compute_live_accuracy(
@@ -573,19 +599,17 @@ class DataStreamerThread(QThread):
         return {"near": near, "mid": mid, "far": far, "overall": overall}
 
     def _get_hardware_metrics(self, fps: float, target_fps: float, latency: float) -> HardwareMetrics:
-        # OPT-14: psutil.cpu_percent() and pynvml GPU queries are system calls
-        # that cost ~0.5-1ms each.  Cache the system-level snapshot for up to
-        # 100ms and only update fps/latency (which are computed each frame and
-        # do not come from system calls) on cached hits.
+        # psutil/pynvml are system calls (~0.5-1 ms each), so the system-level
+        # snapshot is reused for up to 100 ms. Every call still returns its OWN
+        # object with this frame's fps/latency: FrameStates are kept for STEP
+        # back, so a shared, mutated object would rewrite old frames' numbers.
         now = time.perf_counter()
         if (self._last_hw_snapshot is not None
                 and (now - self._last_hw_time) < 0.1):
-            hm = self._last_hw_snapshot
-            hm.fps = fps
-            hm.achieved_fps = fps
-            hm.target_fps = target_fps
-            hm.latency_ms = latency * 1000.0
-            return hm
+            return dataclasses.replace(
+                self._last_hw_snapshot,
+                fps=fps, achieved_fps=fps, target_fps=target_fps, latency_ms=latency * 1000.0,
+            )
 
         cpu_percent = psutil.cpu_percent(interval=None)
         mem = psutil.virtual_memory()
@@ -616,7 +640,7 @@ class DataStreamerThread(QThread):
 
         self._last_hw_time = now
         self._last_hw_snapshot = hm
-        return hm
+        return dataclasses.replace(hm)
 
     def _setup_sources(self):
         """Prepare file list or synthetic generators based on self.source."""
@@ -625,12 +649,19 @@ class DataStreamerThread(QThread):
         self._sample_translation_step = np.array([0.5, 0.0, 0.0], dtype=np.float64)
         self._file_list = []
 
+        if self.lidar_source is not None:
+            return
+
         if self.source == "sample":
             self._sample_static_pts, self._sample_moving_pts = generate_synthetic_sample_cloud(
                 n_static=2000, n_moving=150
             )
         elif self.source == "semantickitti":
-            kitti_root = self.data_root or Path("data/semantic_kitti/dataset/sequences")
+            kitti_root = Path(self.data_root) if self.data_root else Path("data/semantic_kitti/dataset/sequences")
+            if (kitti_root / "dataset" / "sequences").exists():
+                kitti_root = kitti_root / "dataset" / "sequences"
+            elif (kitti_root / "sequences").exists():
+                kitti_root = kitti_root / "sequences"
             seq_dir = kitti_root / self.sequence / "velodyne"
             if seq_dir.exists():
                 self._file_list = sorted(list(seq_dir.glob("*.bin")))
@@ -641,7 +672,7 @@ class DataStreamerThread(QThread):
                     n_static=2000, n_moving=150
                 )
         elif self.source == "rellis3d":
-            rellis_root = self.data_root or Path("C:/dev/data/rellis3d")
+            rellis_root = Path(self.data_root) if self.data_root else Path("C:/dev/data/rellis3d")
             if not rellis_root.exists():
                 rellis_root = Path("data/rellis3d")
             seq_dir = rellis_root / "Rellis-3D" / self.sequence / "os1_cloud_node_kitti_bin"
@@ -656,6 +687,10 @@ class DataStreamerThread(QThread):
 
     def _get_frame_data(self, frame_idx: int) -> tuple[np.ndarray, np.ndarray | None]:
         """Fetch (points, semantic_labels) for frame_idx from active source."""
+        if self.lidar_source is not None:
+            f = self.lidar_source.frame(frame_idx % len(self.lidar_source))
+            return f.points, f.foveax_labels
+
         if self.source == "sample":
             offset = self._sample_translation_step * frame_idx
             frame_moving = repeated_cloud_with_translation(self._sample_moving_pts, offset)
@@ -667,7 +702,7 @@ class DataStreamerThread(QThread):
         file_path = self._file_list[frame_idx % len(self._file_list)]
 
         if self.source == "rellis3d" and HAS_RELLIS_LOADER:
-            rellis_root = self.data_root or Path("C:/dev/data/rellis3d")
+            rellis_root = Path(self.data_root) if self.data_root else Path("C:/dev/data/rellis3d")
             if not rellis_root.exists():
                 rellis_root = Path("data/rellis3d")
             try:
@@ -701,30 +736,39 @@ class DataStreamerThread(QThread):
 
         return points, semantic_labels
 
+    def available_frames(self) -> int | None:
+        """Number of real frames on disk for the active source (None = unbounded)."""
+        if self.lidar_source is not None:
+            return len(self.lidar_source)
+        return len(self._file_list) or None
+
+    def timestamp_for(self, frame_idx: int) -> float:
+        """Timestamp (s) of a frame: the data's own if the source has them,
+        otherwise frame_idx / sensor_hz. Past the end of a finite source it
+        keeps counting at sensor_hz so it stays strictly increasing."""
+        src = self.lidar_source
+        if src is not None:
+            n = len(src)
+            if frame_idx < n:
+                return src.timestamp(frame_idx)
+            return src.timestamp(n - 1) + (frame_idx - n + 1) / self.sensor_hz
+        return frame_idx / self.sensor_hz
+
     def _get_frame_points(self, frame_idx: int) -> np.ndarray:
         """Fetch points for frame_idx from active source."""
         points, _ = self._get_frame_data(frame_idx)
         return points
 
-    @staticmethod
-    def _voxel_downsample_np(points: np.ndarray, leaf_size: float = 0.25) -> np.ndarray:
-        """OPT-15: Fast voxel downsampling via integer binning.
+    def compute_stateless(self, frame_idx: int, timestamp_s: float) -> dict:
+        """Everything about a frame that does NOT depend on the tracker:
+        load, semantic labels, live accuracy, detection + classification +
+        terrain features, and the tracker-independent grid maps.
 
-        Returns one representative point per (leaf_size × leaf_size × leaf_size)
-        voxel.  Used only for the grid-aggregation path; detection/tracking
-        always uses the full original cloud.
+        It is a pure function of (frame_idx, timestamp_s) and this object's
+        configuration, so it can run in a worker process for frames ahead of
+        the one being tracked/rendered (src/dashboard/frame_pipeline.py). The
+        result is finished, in frame order, by finish_frame().
         """
-        if len(points) == 0:
-            return points
-        vox = (points[:, :3] / leaf_size).astype(np.int32)
-        keys = (vox[:, 0].astype(np.int64) * 100_003
-                + vox[:, 1].astype(np.int64) * 1_009
-                + vox[:, 2].astype(np.int64))
-        _, first = np.unique(keys, return_index=True)
-        return points[first]
-
-    def process_frame(self, frame_idx: int, timestamp_s: float, fps: float = 10.0) -> FrameState:
-        """Process a single frame through detection, tracking, grid mapping, and metrics."""
         t_start = time.perf_counter()
         # Optional StageTimer (set only by `--profile`); None => every region
         # below is a no-op and behavior is identical to the un-instrumented code.
@@ -732,10 +776,6 @@ class DataStreamerThread(QThread):
 
         def _t(name):
             return _timer.time(name) if _timer is not None else nullcontext()
-
-        # OPT-3/4: Store frame index so hazard and centerline throttle caches
-        # inside _compute_real_extras can reference it without an extra argument.
-        self._current_frame_idx = frame_idx
 
         with _t("load"):
             points, gt_labels = self._get_frame_data(frame_idx)
@@ -787,7 +827,7 @@ class DataStreamerThread(QThread):
             if x_max_cloud < 0 or x_max_cloud > 100:
                 print(f"[WARNING] Point cloud X range out of expected KITTI coordinate bounds (x_max={x_max_cloud:.1f}).")
 
-        # Detect & Track with semantic cross-referencing
+        # Detect with semantic cross-referencing
         with _t("clustering_heuristics"):
             try:
                 detections = self.detector.detect(points, timestamp_s=timestamp_s, semantic_labels=semantic_labels)
@@ -805,28 +845,52 @@ class DataStreamerThread(QThread):
 
             self._attach_terrain_features(detections, points)
 
+        # Grids (every frame, from every point -- nothing is skipped or thinned)
+        with _t("grid_maps_hazards"):
+            grid_base = self._grid_base(points)
+
+        with _t("display_downsample"):
+            display_points = self._display_downsample(points)
+
+        # Cloud bounds for the coordinate-frame sanity check (a full pass over
+        # every point, so it is computed here, off the GUI thread, not in finish_frame).
+        point_bounds = (np.min(points[:, :2], axis=0), np.max(points[:, :2], axis=0)) if len(points) > 0 else None
+
+        return {
+            "frame_idx": frame_idx,
+            "points": points,
+            "has_ground_truth": has_ground_truth,
+            "accuracy_metrics": accuracy_metrics,
+            "detections": detections,
+            "grid_base": grid_base,
+            "display_points": display_points,
+            "point_bounds": point_bounds,
+            "compute_s": time.perf_counter() - t_start,
+        }
+
+    def finish_frame(self, result: dict, timestamp_s: float, fps: float = 10.0) -> FrameState:
+        """Track (stateful, strictly in frame order), add the track-dependent
+        grid parts, and assemble the FrameState from a compute_stateless()
+        result computed here or in a worker process."""
+        t_start = time.perf_counter()
+        _timer = getattr(self, "stage_timer", None)
+
+        def _t(name):
+            return _timer.time(name) if _timer is not None else nullcontext()
+
         with _t("kalman_tracking"):
-            tracks = self.tracker.update(detections, timestamp_s=timestamp_s)
+            tracks = [_snapshot_track(t) for t in self.tracker.update(result["detections"], timestamp_s=timestamp_s)]
 
         track_velocities = {
             t.track_id: (float(t.state[3]), float(t.state[4]))
             for t in tracks
         }
 
-        # Grids
         with _t("grid_maps_hazards"):
-            # OPT-15: Voxel-downsample the cloud before the grid aggregation
-            # path.  Detection/tracking use the full `points` (above); only
-            # _generate_maps benefits from reduced point density since the
-            # 0.5m grid resolution already aggregates 4-8 points per cell on
-            # average -- a 0.25m voxel pre-filter loses no meaningful grid
-            # information while cutting the cloud to ~20-30k points (~5×
-            # fewer scatter ops in np.maximum.at / np.minimum.at).
-            grid_points = self._voxel_downsample_np(points, leaf_size=0.25)
-            grids = self._generate_maps(grid_points, tracks)
+            grids = self._finish_grids(result["grid_base"], tracks)
 
-        t_end = time.perf_counter()
-        latency = t_end - t_start
+        # Processing time of this frame (excludes time spent waiting in a queue).
+        latency = result["compute_s"] + (time.perf_counter() - t_start)
         target_fps = self.rate_hz
 
         _tail = _t("metrics_state_logging")
@@ -835,9 +899,9 @@ class DataStreamerThread(QThread):
 
         extras = getattr(self, "_last_extras", {})
         state = FrameState(
-            frame_idx=frame_idx,
+            frame_idx=result["frame_idx"],
             timestamp_s=timestamp_s,
-            points=points,
+            points=result["points"],
             tracks=tracks,
             track_velocities=track_velocities,
             grid_maps=grids,
@@ -852,17 +916,22 @@ class DataStreamerThread(QThread):
             occupied_fraction=extras.get("occupied_fraction"),
             centerline_profile=extras.get("centerline_profile", []),
             centerline_markers=extras.get("centerline_markers", []),
-            has_ground_truth=has_ground_truth,
+            has_ground_truth=result["has_ground_truth"],
             predictor_mode=self.predictor_mode,
-            accuracy_metrics=accuracy_metrics,
+            accuracy_metrics=result["accuracy_metrics"],
+            display_points=result.get("display_points"),
         )
-        state.coordinate_warnings = assert_coordinate_frame_consistency(state)
+        state.coordinate_warnings = assert_coordinate_frame_consistency(state, result.get("point_bounds"))
         for w in state.coordinate_warnings:
             print(f"[WARNING] {w}")
 
         self._log_session(state)
         _tail.__exit__(None, None, None)
         return state
+
+    def process_frame(self, frame_idx: int, timestamp_s: float, fps: float = 10.0) -> FrameState:
+        """Process a single frame through detection, tracking, grid mapping, and metrics."""
+        return self.finish_frame(self.compute_stateless(frame_idx, timestamp_s), timestamp_s, fps)
 
     def run(self):
         self._setup_sources()
@@ -891,14 +960,26 @@ class DataStreamerThread(QThread):
         import os
         from pathlib import Path
         
-        log_dir = Path("outputs/phase9/session")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / "dashboard_session.jsonl"
-        
-        # Log rotation based on size (e.g. 10MB)
-        if log_path.exists() and log_path.stat().st_size > 10 * 1024 * 1024:
-            log_path.rename(log_dir / f"dashboard_session_{int(time.time())}.jsonl")
-            
+        # The log file stays open between frames (reopening it every frame cost
+        # more than the rest of the logging); the size-based rotation (10 MB) is
+        # checked every 200 frames, which is plenty for ~100-byte records.
+        try:
+            fh, n = self._log_fh, self._log_writes
+        except (AttributeError, RuntimeError):
+            fh, n = None, 0
+        if fh is None or n % 200 == 0:
+            log_dir = Path("outputs/phase9/session")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / "dashboard_session.jsonl"
+            if fh is not None and log_path.exists() and log_path.stat().st_size > 10 * 1024 * 1024:
+                fh.close()
+                fh = None
+                log_path.rename(log_dir / f"dashboard_session_{int(time.time())}.jsonl")
+            if fh is None:
+                fh = open(log_path, "a", buffering=1)  # line-buffered: each record reaches the file
+            self._log_fh = fh
+        self._log_writes = n + 1
+
         record = {
             "schema_version": state.schema_version,
             "frame_idx": state.frame_idx,
@@ -912,9 +993,15 @@ class DataStreamerThread(QThread):
             "cpu_percent": state.metrics.cpu_percent
         }
         
-        with open(log_path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-            
+        fh.write(json.dumps(record) + chr(10))
+
     def stop(self):
         self.running = False
         self.wait()
+        fh = getattr(self, "_log_fh", None)
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+            self._log_fh = None

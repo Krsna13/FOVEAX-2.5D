@@ -69,9 +69,21 @@ def test_qt_main_window_uses_correct_colormap_and_lethal_threshold():
     # No assertion on rendered pixels needed beyond it not raising: the real
     # regression coverage is the source-level checks below, which confirm the
     # exact convention constants used inside _render_grid_to_label.
+    # The pixel logic lives in grid_to_rgba8() (a pure function, so it can be tested);
+    # _render_grid_to_label only turns its result into a pixmap.
     import inspect
-    src = inspect.getsource(FoveaXDashboardWindow._render_grid_to_label)
-    assert 'mpl.colormaps["RdYlGn"]' in src
+    from src.dashboard.qt_main_window import grid_to_rgba8
+
+    src = inspect.getsource(grid_to_rgba8)
+    assert '"traversability": "RdYlGn"' in src
     assert '(grid < 0.40)' in src
     assert 'RdYlGn_r' not in src
     assert '(grid > 0.70)' not in src
+    assert "grid_to_rgba8(" in inspect.getsource(FoveaXDashboardWindow._render_grid_to_label)
+
+    # Behaviour, not just source text: 1.0 (safe) draws green, 0.0 (blocked) draws red.
+    rgba = grid_to_rgba8(grid, "traversability")
+    safe, blocked = rgba[0, 0], rgba[9, 9]
+    assert safe[1] > safe[0], f"safe cell must be green-dominant, got {safe}"
+    assert blocked[0] > blocked[1], f"blocked cell must be red-dominant, got {blocked}"
+    assert rgba[5, 5, 3] == 0  # NaN cell is transparent
