@@ -213,10 +213,7 @@ class DataStreamerThread(QThread):
     def _display_downsample(self, points: np.ndarray):
         """Voxel-thinned copy of the cloud for the 3D VIEW ONLY (see
         FrameState.display_points). Perception never sees it."""
-        try:
-            voxel = float(self.display_voxel_m)
-        except (AttributeError, RuntimeError):
-            voxel = 0.15
+        voxel = float(self.display_voxel_m)
         if voxel <= 0.0 or len(points) == 0:
             return None
         try:
@@ -235,19 +232,10 @@ class DataStreamerThread(QThread):
         return np.column_stack([xyz, np.zeros(len(xyz), dtype=np.float32)])
 
     def _overhead_params(self) -> dict:
-        """Overhead-detection thresholds with defaults. Reading attributes of a
-        Qt object whose constructor never ran raises RuntimeError (not
-        AttributeError), which tests that build a bare streamer rely on us
-        absorbing."""
-        out = {}
-        for kwarg, attr, default in (("min_points", "overhead_min_points", 4),
-                                     ("clearance_threshold_m", "clearance_threshold_m", 2.0),
-                                     ("ground_noise_m", "ground_noise_m", 0.30)):
-            try:
-                out[kwarg] = getattr(self, attr)
-            except (AttributeError, RuntimeError):
-                out[kwarg] = default
-        return out
+        """Overhead-detection thresholds, as set on this streamer."""
+        return {"min_points": self.overhead_min_points,
+                "clearance_threshold_m": self.clearance_threshold_m,
+                "ground_noise_m": self.ground_noise_m}
 
     def _grid_base(self, points: np.ndarray) -> dict:
         x = points[:, 0]
@@ -963,10 +951,7 @@ class DataStreamerThread(QThread):
         # The log file stays open between frames (reopening it every frame cost
         # more than the rest of the logging); the size-based rotation (10 MB) is
         # checked every 200 frames, which is plenty for ~100-byte records.
-        try:
-            fh, n = self._log_fh, self._log_writes
-        except (AttributeError, RuntimeError):
-            fh, n = None, 0
+        fh, n = self._log_fh, self._log_writes
         if fh is None or n % 200 == 0:
             log_dir = Path("outputs/phase9/session")
             log_dir.mkdir(parents=True, exist_ok=True)

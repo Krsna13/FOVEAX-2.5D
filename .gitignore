@@ -40,3 +40,6 @@ src/graphify-out/
 # Packaging output
 dist/
 build/
+
+# Test outputs
+tests/outputs/
